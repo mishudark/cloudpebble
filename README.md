@@ -193,7 +193,115 @@ A background goroutine periodically flushes memtables to local SSTs, uploads the
 
 Eventual consistency converges to strong over time as the background WAL replay loop catches up and the periodic Sync uploads new checkpoints.
 
-## Usage
+## Bigtable API (gRPC)
+
+CloudPebble includes a [Google Cloud Bigtable v2](https://cloud.google.com/bigtable/docs/reference/data-plane/rpc) compatible gRPC server that maps Bigtable's wide-column data model onto Pebble's key-value store. Each Bigtable table is backed by a separate CloudPebble namespace with its own Pebble DB + object storage durability.
+
+The implementation follows the same key-encoding approach described in [Pinterest's Rockstorewidecolumn](https://medium.com/pinterest-engineering/building-pinterests-new-wide-column-database-using-rocksdb-f9b5f55d04e5).
+
+### Data Model Mapping
+
+```
+Bigtable:  table / row_key / column_family / column_qualifier / timestamp → value
+Pebble:    [row_len:2][row_key][00][family_len:1][family][00][qual_len:2][qualifier][00][inverted_ts:8] → value
+```
+
+Timestamps are inverted (`math.MaxInt64 - ts`) so the newest cells sort first under Pebble's ascending lexicographic order. Components are length-prefixed and separated by `0x00` sentinels, avoiding any escape-encoding overhead.
+
+### Supported RPCs
+
+| RPC | Status | Notes |
+|-----|--------|-------|
+| `ReadRows` | Done | Server-streaming CellChunk protocol, `RowSet`/`RowRange` support, `rows_limit` |
+| `MutateRow` | Done | Atomic row-level mutations via Pebble `Batch` |
+| `MutateRows` | Done | Batch mutations with per-entry `google.rpc.Status` |
+| `CheckAndMutateRow` | Done | Atomic conditional mutate with predicate filter |
+| `SampleRowKeys` | Done | Split-key sampling from SST file boundaries |
+| `PingAndWarm` | Done | Health check + cache warming |
+| `OpenTable` | Done | Session-based bidirectional streaming protocol |
+| `ReadModifyWriteRow` | Stub | Returns `Unimplemented` |
+| Change stream RPCs | Stub | Returns `Unimplemented` |
+| SQL RPCs | Stub | Returns `Unimplemented` |
+
+### RowFilter Support
+
+| Filter | Status |
+|--------|--------|
+| `chain` | Done |
+| `interleave` | Done (with duplicate suppression) |
+| `condition` | Done |
+| `pass_all_filter` / `block_all_filter` | Done |
+| `row_key_regex_filter` | Done |
+| `family_name_regex_filter` | Done |
+| `column_qualifier_regex_filter` | Done |
+| `column_range_filter` | Done |
+| `timestamp_range_filter` | Done |
+| `cells_per_row_offset_filter` | Done |
+| `cells_per_row_limit_filter` | Done |
+| `cells_per_column_limit_filter` | Done |
+| `strip_value_transformer` | Done |
+| `apply_label_transformer` | Done |
+| `value_regex_filter` | Future |
+| `value_range_filter` | Future |
+| `row_sample_filter` | Future |
+| `sink` | Future |
+
+### Running the Bigtable Server
+
+```bash
+go run ./cmd/pebble-bigtable/ --addr :9000 --data-dir /tmp/btdb --object-dir /tmp/btobj
+```
+
+### Using with a Bigtable Client
+
+```go
+import (
+    "github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
+    "google.golang.org/grpc"
+)
+
+conn, _ := grpc.Dial("localhost:9000", grpc.WithInsecure())
+client := bigtablepb.NewBigtableClient(conn)
+
+// Direct RPCs
+resp, _ := client.MutateRow(ctx, &bigtablepb.MutateRowRequest{
+    TableName: "my-table",
+    RowKey:    []byte("user123"),
+    Mutations: []*bigtablepb.Mutation{
+        {Mutation: &bigtablepb.Mutation_SetCell_{
+            SetCell: &bigtablepb.Mutation_SetCell{
+                FamilyName:      "profile",
+                ColumnQualifier: []byte("name"),
+                TimestampMicros: -1,
+                Value:           []byte("Alice"),
+            },
+        }},
+    },
+})
+```
+
+### Architecture
+
+```
+Bigtable gRPC client
+       │
+       ▼
+┌──────────────────────────────────────┐
+│  pkg/bigtable/Server                  │
+│  ├─ MutateRow → pebble.Batch.Apply    │
+│  ├─ ReadRows  → pebble.Iterator       │
+│  ├─ OpenTable → bidi session stream   │
+│  └─ RowFilter → filter evaluator tree │
+└──────────────┬───────────────────────┘
+               │
+    ┌──────────▼──────────┐
+    │  pkg/engine/Engine   │  per-table namespace
+    │  ├─ Pebble (cache)   │
+    │  └─ GCS/local (WAL)  │
+    └─────────────────────┘
+```
+
+## Usage (Embedded Engine)
 
 ```go
 package main
@@ -299,15 +407,27 @@ To add a new backend, implement the `Store` interface and pass it to `engine.Opt
 
 ```
 cloudpebble/
+├── BIGTABLE_PLAN.md                   # Bigtable API implementation plan
 ├── DESIGN.md                         # Architecture design document
 ├── PLAN.md                           # Implementation plan (shortcuts → production)
 ├── cmd/
 │   ├── cloudpebble/main.go           # Demo CLI
+│   ├── pebble-bigtable/main.go       # Bigtable gRPC server
 │   ├── test-recovery/main.go         # Crash recovery integration test
 │   ├── test-incremental/main.go      # Incremental upload test
 │   ├── test-eventual/main.go         # Eventual consistency test
 │   └── test-coldmiss/main.go         # Cold miss recovery test
 ├── pkg/
+│   ├── bigtable/
+│   │   ├── server.go                 # gRPC server + table registry
+│   │   ├── session.go                # OpenTable bidi stream handler
+│   │   ├── encoding.go               # Bigtable → Pebble key encoding
+│   │   ├── mutate.go                 # MutateRow / MutateRows / CheckAndMutateRow
+│   │   ├── readrows.go               # ReadRows: CellChunk streaming
+│   │   ├── filter.go                 # RowFilter evaluation engine
+│   │   ├── samplekeys.go             # SampleRowKeys
+│   │   ├── types.go                  # RowProcessor callback type
+│   │   └── bigtablepb/               # Generated proto Go code
 │   ├── objstore/
 │   │   ├── store.go                  # Store interface + ObjectInfo
 │   │   ├── gcs/gcs.go                # Google Cloud Storage backend

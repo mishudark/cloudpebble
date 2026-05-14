@@ -4,3 +4,7 @@ testdata/
 *.swp
 *.swo
 *.backup
+/cmd/cloudpebble/cloudpebble
+/cmd/pebble-bigtable/pebble-bigtable
+/pebble-bigtable
+*.test
