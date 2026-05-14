@@ -84,8 +84,10 @@ type Options struct {
 	OrphanWALTTL time.Duration
 
 	// BatchWindow controls WAL batching. Concurrent writes within this
-	// window are coalesced into a single GCS WAL object. Zero disables
-	// batching. Default: 1s (matching turbopuffer's 1 WAL entry/sec).
+	// window are coalesced into a single GCS WAL object, amortizing GCS
+	// round-trips across many writers. Set to a negative value to disable
+	// batching (each write creates its own WAL object). Zero means use
+	// the default (1s).
 	BatchWindow time.Duration
 
 	// MaxLocalBytes is the soft limit on the local Pebble cache size. When

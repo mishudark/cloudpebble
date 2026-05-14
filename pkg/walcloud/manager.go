@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mishudark/cloudpebble/pkg/objstore"
@@ -49,8 +50,8 @@ type Manager struct {
 	nextSeq uint64
 
 	// Batching state. Protected by mu.
-	pending    []byte        // accumulated batch data for current window
-	pendingSeq uint64        // sequence number for the pending batch
+	pending    [][]byte      // batch repr segments for current window
+	pendingSeq uint64
 	waiters    []chan error  // callers waiting for this batch to commit
 	commitTimer *time.Timer
 }
@@ -74,9 +75,9 @@ func NewManager(store objstore.Store, namespace string, batchWindow time.Duratio
 	}
 	if len(entries) > 0 {
 		last := entries[len(entries)-1]
-		m.nextSeq = last.Seq + 1
+		atomic.StoreUint64(&m.nextSeq, last.Seq+1)
 	} else {
-		m.nextSeq = 1
+		atomic.StoreUint64(&m.nextSeq, 1)
 	}
 	return m, nil
 }
@@ -103,52 +104,38 @@ func (m *Manager) walPrefix() string {
 //
 // Sequence numbers are assigned monotonically and returned immediately.
 func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, done <-chan error, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if m.batchWindow <= 0 {
-		// Direct write path: no batching.
-		return m.writeDirectLocked(ctx, data)
+		// Direct write path: no mutex at all.
+		// Sequence numbers are allocated atomically so writes are fully
+		// concurrent — the only serialization is the underlying store.Put.
+		seq = atomic.AddUint64(&m.nextSeq, 1) - 1
+		p := m.walPath(seq)
+		if err := m.store.Put(ctx, p, data); err != nil {
+			return 0, nil, fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
+		}
+		return seq, nil, nil
 	}
 
-	// Batching path.
+	// Batching path: O(1) per writer under a short-lived mutex.
+	m.mu.Lock()
 	if m.pending == nil {
-		// First write in the window: allocate a seq and start the timer.
-		m.pendingSeq = m.nextSeq
-		m.nextSeq++
-		m.pending = make([]byte, len(data))
-		copy(m.pending, data)
-		ch := make(chan error, 1)
-		m.waiters = []chan error{ch}
+		m.pendingSeq = atomic.AddUint64(&m.nextSeq, 1) - 1
+		m.pending = make([][]byte, 0, 16)
 		m.commitTimer = time.AfterFunc(m.batchWindow, m.flushPending)
-		return m.pendingSeq, ch, nil
 	}
-
-	// Subsequent write in the window: merge into the pending batch.
-	m.pending = appendBatch(m.pending, data)
+	m.pending = append(m.pending, data)
 	ch := make(chan error, 1)
 	m.waiters = append(m.waiters, ch)
+	m.mu.Unlock()
+
 	return m.pendingSeq, ch, nil
 }
 
-// writeDirectLocked creates a single WAL object synchronously. Must be
-// called with m.mu held.
-func (m *Manager) writeDirectLocked(ctx context.Context, data []byte) (uint64, <-chan error, error) {
-	seq := m.nextSeq
-	m.nextSeq++
-
-	p := m.walPath(seq)
-	if err := m.store.Put(ctx, p, data); err != nil {
-		return 0, nil, fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
-	}
-	return seq, nil, nil
-}
-
-// flushPending commits the current pending batch to object storage and
-// wakes all waiters. Called by the commit timer.
+// flushPending merges all pending segments into a single valid batch repr,
+// writes it to object storage, and wakes all waiters. Called by the timer.
 func (m *Manager) flushPending() {
 	m.mu.Lock()
-	data := m.pending
+	segments := m.pending
 	seq := m.pendingSeq
 	waiters := m.waiters
 	m.pending = nil
@@ -156,9 +143,13 @@ func (m *Manager) flushPending() {
 	m.waiters = nil
 	m.mu.Unlock()
 
-	if data == nil {
+	if len(segments) == 0 {
 		return
 	}
+
+	// Merge all segments into one valid Pebble batch repr.
+	// Cost is O(total_size) paid once here, not per-writer in WriteRecord.
+	data := mergeBatchSegments(segments)
 
 	var gcsErr error
 	p := m.walPath(seq)
@@ -171,35 +162,71 @@ func (m *Manager) flushPending() {
 	}
 }
 
-// appendBatch merges two Pebble batch representations into one. Both are
-// self-contained batch reprs. We strip the header from the second batch
-// and append only its records to the first, then update the count header.
-func appendBatch(into, extra []byte) []byte {
-	if len(into) < 8 || len(extra) < 8 {
-		return append(into, extra...)
+// batchHeaderLen is the Pebble batch repr header size (seqnum + count).
+const batchHeaderLen = 12
+
+// batchCount reads the record count from a Pebble batch repr header.
+func batchCount(data []byte) int {
+	if len(data) < batchHeaderLen {
+		return 0
 	}
-	// Pebble batch repr layout: [8-byte header: seqnum(8) count(4)...] records...
-	// We need to append the extra batch's records to into and update the count.
-	// The header is 12 bytes (seqnum + count), followed by records.
-	const headerLen = 12
-	if len(into) < headerLen || len(extra) < headerLen {
-		return append(into, extra...)
+	return int(data[8]) | int(data[9])<<8 | int(data[10])<<16 | int(data[11])<<24
+}
+
+// setBatchCount writes the record count into a Pebble batch repr header.
+func setBatchCount(data []byte, n int) {
+	data[8] = byte(n)
+	data[9] = byte(n >> 8)
+	data[10] = byte(n >> 16)
+	data[11] = byte(n >> 24)
+}
+
+// mergeBatchSegments merges N Pebble batch repr segments into one valid
+// batch repr. The first segment's header is kept; subsequent headers are
+// stripped. Falls back to raw concatenation for undersized segments.
+func mergeBatchSegments(segments [][]byte) []byte {
+	if len(segments) == 0 {
+		return nil
 	}
-	// Read current count from into
-	curCount := int(into[8]) | int(into[9])<<8 | int(into[10])<<16 | int(into[11])<<24
-	// Read extra count from extra
-	extraCount := int(extra[8]) | int(extra[9])<<8 | int(extra[10])<<16 | int(extra[11])<<24
+	if len(segments) == 1 {
+		return segments[0]
+	}
 
-	// Append everything after the header from extra
-	result := append(into, extra[headerLen:]...)
+	// Compute total size with header stripping.
+	total := len(segments[0])
+	allValid := true
+	for _, s := range segments[1:] {
+		if len(s) < 8 {
+			allValid = false
+			total += len(s) // can't strip header, just append raw
+		} else if len(s) < batchHeaderLen {
+			total += len(s)
+		} else {
+			total += len(s) - batchHeaderLen
+		}
+	}
+	if !allValid {
+		// Fall back to raw concatenation for undersized segments.
+		result := make([]byte, 0, total)
+		for _, s := range segments {
+			result = append(result, s...)
+		}
+		return result
+	}
 
-	// Update count
-	newCount := curCount + extraCount
-	result[8] = byte(newCount)
-	result[9] = byte(newCount >> 8)
-	result[10] = byte(newCount >> 16)
-	result[11] = byte(newCount >> 24)
+	result := make([]byte, total)
+	pos := copy(result, segments[0])
+	totalCount := batchCount(segments[0])
 
+	for _, s := range segments[1:] {
+		totalCount += batchCount(s)
+		if len(s) <= batchHeaderLen {
+			continue
+		}
+		pos += copy(result[pos:], s[batchHeaderLen:])
+	}
+
+	setBatchCount(result, totalCount)
 	return result
 }
 
@@ -283,7 +310,5 @@ func (m *Manager) GC(ctx context.Context, maxSeq uint64, orphanTTL time.Duration
 
 // NextSeq returns the next sequence number that will be assigned.
 func (m *Manager) NextSeq() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.nextSeq
+	return atomic.LoadUint64(&m.nextSeq)
 }
