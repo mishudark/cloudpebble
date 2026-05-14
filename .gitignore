@@ -1,0 +1,6 @@
+testdata/
+/tmp/
+.DS_Store
+*.swp
+*.swo
+*.backup
