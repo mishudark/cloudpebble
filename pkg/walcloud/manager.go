@@ -194,7 +194,7 @@ func mergeBatchSegments(segments [][]byte) []byte {
 
 	// Compute total size with header stripping.
 	total := len(segments[0])
-	allValid := true
+	allValid := len(segments[0]) >= batchHeaderLen
 	for _, s := range segments[1:] {
 		if len(s) < 8 {
 			allValid = false
