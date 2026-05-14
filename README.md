@@ -258,9 +258,10 @@ go run ./cmd/pebble-bigtable/ --addr :9000 --data-dir /tmp/btdb --object-dir /tm
 import (
     "github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
     "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
 )
 
-conn, _ := grpc.Dial("localhost:9000", grpc.WithInsecure())
+conn, _ := grpc.Dial("localhost:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
 client := bigtablepb.NewBigtableClient(conn)
 
 // Direct RPCs

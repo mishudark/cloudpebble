@@ -5,6 +5,7 @@ package local
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -117,3 +118,30 @@ func (s *Store) Attrs(ctx context.Context, path string) (objstore.ObjectInfo, er
 }
 
 func (s *Store) Close() error { return nil }
+
+func (s *Store) PutReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	full := s.path(path)
+	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+		return fmt.Errorf("local: mkdir for %s: %w", path, err)
+	}
+	f, err := os.Create(full)
+	if err != nil {
+		return fmt.Errorf("local: creating %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, r); err != nil {
+		return fmt.Errorf("local: writing %s: %w", path, err)
+	}
+	return nil
+}
+
+func (s *Store) GetReader(ctx context.Context, path string) (io.ReadCloser, error) {
+	f, err := os.Open(s.path(path))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("local: object %s not found: %w", path, err)
+		}
+		return nil, fmt.Errorf("local: opening %s: %w", path, err)
+	}
+	return f, nil
+}

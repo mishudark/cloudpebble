@@ -46,4 +46,15 @@ type Store interface {
 	// Attrs returns metadata about the object at path, including its creation
 	// time and size. Returns an error if the object does not exist.
 	Attrs(ctx context.Context, path string) (ObjectInfo, error)
+
+	// PutReader writes data from an io.Reader to the object at the given path.
+	// The size parameter specifies the total number of bytes to read. This is
+	// more efficient than Put for large objects as it avoids loading the entire
+	// contents into memory.
+	PutReader(ctx context.Context, path string, r io.Reader, size int64) error
+
+	// GetReader returns an io.ReadCloser for the object at path. The caller is
+	// responsible for closing the returned reader. Returns an error if the
+	// object does not exist.
+	GetReader(ctx context.Context, path string) (io.ReadCloser, error)
 }

@@ -45,7 +45,7 @@ func newTestEngine(t testing.TB, ns string, opts ...func(*engine.Options)) *engi
 		fn(&o)
 	}
 
-	e, err := engine.Open(o)
+	e, err := engine.Open(context.Background(), o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func newTestEngineNoCleanup(t testing.TB, ns string, dir, objDir string, opts ..
 	for _, fn := range opts {
 		fn(&o)
 	}
-	e, err := engine.Open(o)
+	e, err := engine.Open(context.Background(), o)
 	if err != nil {
 		t.Fatal(err)
 	}

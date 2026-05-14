@@ -69,7 +69,7 @@ func FuzzSetGetDelete(f *testing.F) {
 			t.Skip(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:               dir,
 			Store:             store,
 			Namespace:         "fuzz",
@@ -120,7 +120,7 @@ func FuzzMultipleOperations(f *testing.F) {
 			t.Skip(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:               dir,
 			Store:             store,
 			Namespace:         "fuzz-multi",
@@ -191,7 +191,7 @@ func FuzzNamespacePaths(f *testing.F) {
 			t.Skip(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:               dir,
 			Store:             store,
 			Namespace:         ns,
@@ -234,7 +234,7 @@ func FuzzMetricsSnapshot(f *testing.F) {
 			t.Skip(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:               dir,
 			Store:             store,
 			Namespace:         "fuzz-metrics",

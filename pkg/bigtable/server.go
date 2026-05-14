@@ -96,7 +96,7 @@ func (s *Server) getEngine(ctx context.Context, tableName string) (*engine.Engin
 	if s.engineOverrides.BatchWindow != 0 {
 		opts.BatchWindow = s.engineOverrides.BatchWindow
 	}
-	eng, err := engine.Open(opts)
+	eng, err := engine.Open(ctx, opts)
 	if err != nil {
 		return nil, fmt.Errorf("opening table %q: %w", tableName, err)
 	}

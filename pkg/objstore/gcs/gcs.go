@@ -130,6 +130,30 @@ func (s *Store) Close() error {
 	return s.client.Close()
 }
 
+func (s *Store) PutReader(ctx context.Context, path string, r io.Reader, size int64) error {
+	w := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewWriter(ctx)
+	w.ObjectAttrs.Size = size
+	if _, err := io.Copy(w, r); err != nil {
+		w.Close()
+		return fmt.Errorf("gcs: writing %s: %w", path, err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("gcs: closing writer for %s: %w", path, err)
+	}
+	return nil
+}
+
+func (s *Store) GetReader(ctx context.Context, path string) (io.ReadCloser, error) {
+	r, err := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewReader(ctx)
+	if err != nil {
+		if isNotExist(err) {
+			return nil, fmt.Errorf("gcs: object %s: %w", path, err)
+		}
+		return nil, fmt.Errorf("gcs: reading %s: %w", path, err)
+	}
+	return r, nil
+}
+
 func isNotExist(err error) bool {
 	if err == storage.ErrObjectNotExist {
 		return true

@@ -1,0 +1,47 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - goconst
+    - gosec
+    - misspell
+    - unconvert
+    - wastedassign
+    - bodyclose
+    - noctx
+    - prealloc
+    - unparam
+
+linters-settings:
+  errcheck:
+    check-type-assertions: true
+    check-blank: false
+  gosec:
+    severity: medium
+    confidence: medium
+  govet:
+    enable-all: true
+    disable:
+      - fieldalignment
+  staticcheck:
+    checks: ["all"]
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - noctx
+    - path: bigtablepb/
+      linters:
+        - unused
+        - govet
+    - path: pkg/bigtable/bigtablepb/
+      text: ".*"

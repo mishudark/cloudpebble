@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -42,11 +43,11 @@ const (
 // last checkpoint version, its file inventory with checksums, and the
 // highest WAL sequence number covered by that checkpoint.
 type Manifest struct {
-	Version     int              `json:"version"`
-	MaxWALSeq   uint64           `json:"max_wal_seq"`
-	CreatedAt   time.Time        `json:"created_at"`
-	PrevVersion int              `json:"prev_version"`
-	Files       []ManifestFile   `json:"files"`
+	Version     int            `json:"version"`
+	MaxWALSeq   uint64         `json:"max_wal_seq"`
+	CreatedAt   time.Time      `json:"created_at"`
+	PrevVersion int            `json:"prev_version"`
+	Files       []ManifestFile `json:"files"`
 }
 
 type ManifestFile struct {
@@ -95,6 +96,10 @@ type Options struct {
 	// means no limit. Default: 0.
 	MaxLocalBytes int64
 
+	// Logger is the structured logger used for engine events. If nil, a
+	// default logger writing to os.Stderr is used.
+	Logger *slog.Logger
+
 	// PebbleOptions are passed through to the underlying Pebble instance.
 	// The Engine forces DisableWAL to true regardless of this setting.
 	PebbleOptions *pebble.Options
@@ -106,6 +111,7 @@ type Engine struct {
 	store    objstore.Store
 	walMgr   *walcloud.Manager
 	localDir string
+	logger   *slog.Logger
 
 	consistency ConsistencyLevel
 
@@ -132,10 +138,15 @@ type Engine struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	errCh   chan error
+	healthy atomic.Bool
+	ready   atomic.Bool
 }
 
 // Open creates or recovers an Engine for the given namespace.
-func Open(opts Options) (*Engine, error) {
+func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if opts.Dir == "" {
 		opts.Dir = os.TempDir()
 	}
@@ -163,6 +174,10 @@ func Open(opts Options) (*Engine, error) {
 	opts.PebbleOptions.EnsureDefaults()
 	opts.PebbleOptions.DisableWAL = true
 
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	}
+
 	walMgr, err := walcloud.NewManager(opts.Store, opts.Namespace, opts.BatchWindow)
 	if err != nil {
 		return nil, fmt.Errorf("engine: creating WAL manager: %w", err)
@@ -177,15 +192,17 @@ func Open(opts Options) (*Engine, error) {
 		store:          opts.Store,
 		walMgr:         walMgr,
 		localDir:       opts.Dir,
+		logger:         opts.Logger,
 		consistency:    opts.Consistency,
 		orphanWALTTL:   opts.OrphanWALTTL,
 		batchWindow:    opts.BatchWindow,
 		maxLocalBytes:  opts.MaxLocalBytes,
 		uploadedFiles:  make(map[string]struct{}),
 		coldMissThresh: int64(opts.ColdMissThreshold),
+		errCh:          make(chan error, 16),
 	}
 
-	if err := e.recover(context.Background()); err != nil {
+	if err := e.recover(ctx); err != nil {
 		return nil, fmt.Errorf("engine: recovery: %w", err)
 	}
 
@@ -193,11 +210,16 @@ func Open(opts Options) (*Engine, error) {
 	e.ctx = ctx
 	e.cancel = cancel
 
+	e.wg.Add(1)
 	go e.syncLoop(opts.SyncInterval)
 
 	if e.consistency == ConsistencyEventual {
+		e.wg.Add(1)
 		go e.walReplayLoop()
 	}
+
+	e.healthy.Store(true)
+	e.ready.Store(true)
 
 	return e, nil
 }
@@ -216,7 +238,6 @@ func (e *Engine) recover(ctx context.Context) error {
 	if hasManifest {
 		var m Manifest
 		if err := json.Unmarshal(manifestBytes, &m); err != nil {
-			// Try old format: {MaxWALSeq: N}
 			var old struct{ MaxWALSeq uint64 }
 			if err2 := json.Unmarshal(manifestBytes, &old); err2 != nil {
 				return fmt.Errorf("decoding manifest: %w", err)
@@ -256,7 +277,6 @@ func (e *Engine) recover(ctx context.Context) error {
 		return fmt.Errorf("opening pebble: %w", err)
 	}
 
-	// Close previous db if this is a mid-life recovery (cold miss trigger).
 	e.dbMu.Lock()
 	if e.db != nil {
 		e.db.Close()
@@ -310,6 +330,7 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 // eventual-consistency open. This self-heals the node by gradually catching
 // it up to the latest durable state.
 func (e *Engine) walReplayLoop() {
+	defer e.wg.Done()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -317,8 +338,12 @@ func (e *Engine) walReplayLoop() {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := e.replayWALs(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "engine: WAL replay error: %v\n", err)
+			if err := e.replayWALs(e.ctx); err != nil {
+				e.logger.Error("WAL replay error", "error", err)
+				select {
+				case e.errCh <- fmt.Errorf("wal replay: %w", err):
+				default:
+				}
 			}
 		}
 	}
@@ -340,9 +365,6 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 	e.metrics.WALObjectsWritten.Add(1)
 	e.metrics.BytesWrittenWAL.Add(int64(len(data)))
 
-	// Apply to local Pebble immediately. Writes are visible before the
-	// GCS commit, trading a small window of potential data loss (if the
-	// process crashes before the GCS write completes) for low latency.
 	applyStart := time.Now()
 	e.dbMu.RLock()
 	err = e.db.Apply(batch, pebble.NoSync)
@@ -352,7 +374,6 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 		return 0, fmt.Errorf("engine: applying: %w", err)
 	}
 
-	// Wait for GCS durability if batching is enabled.
 	if done != nil {
 		select {
 		case gcsErr := <-done:
@@ -452,17 +473,23 @@ func (e *Engine) triggerColdRecovery() {
 	if !e.recovering.CompareAndSwap(false, true) {
 		return
 	}
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		defer e.recovering.Store(false)
 		defer e.coldMissCount.Store(0)
 
 		e.metrics.ColdRecoveries.Add(1)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(e.ctx, 5*time.Minute)
 		defer cancel()
 
 		if err := e.recover(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "engine: cold recovery failed: %v\n", err)
+			e.logger.Error("cold recovery failed", "error", err)
+			select {
+			case e.errCh <- fmt.Errorf("cold recovery: %w", err):
+			default:
+			}
 		}
 	}()
 }
@@ -483,6 +510,32 @@ func (e *Engine) DB() *pebble.DB {
 // for concurrent access.
 func (e *Engine) Metrics() *Metrics {
 	return &e.metrics
+}
+
+// ---------------------------------------------------------------------------
+// Health and readiness
+// ---------------------------------------------------------------------------
+
+// Health returns nil if the engine is healthy, or an error describing the
+// most recent background failure.
+func (e *Engine) Health() error {
+	if !e.healthy.Load() {
+		return fmt.Errorf("engine: unhealthy")
+	}
+	return nil
+}
+
+// Ready reports whether the engine has completed recovery and is serving requests.
+func (e *Engine) Ready() bool {
+	return e.ready.Load()
+}
+
+// Errors returns a read-only channel that receives errors from background
+// goroutines (sync loop, WAL replay, cold recovery). The channel is buffered;
+// if the buffer is full, errors are dropped. Callers should drain the channel
+// periodically.
+func (e *Engine) Errors() <-chan error {
+	return e.errCh
 }
 
 // ---------------------------------------------------------------------------
@@ -507,9 +560,6 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	db := e.db
 	e.dbMu.RUnlock()
 
-	// Use async flush so new writes can proceed into the next memtable
-	// while the current one is flushed to SSTs. Only the checkpoint
-	// step blocks writes (briefly, for the file copy).
 	flushDone, err := db.AsyncFlush()
 	if err != nil {
 		return fmt.Errorf("engine: flush: %w", err)
@@ -534,16 +584,12 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	dataPrefix := e.dataPrefix()
 	e.mu.Unlock()
 
-	// Files that can change content without changing name (MANIFEST,
-	// OPTIONS, markers) must always be uploaded. SST files are immutable
-	// (new file number on each compaction/flush) so they can be skipped
-	// by name.
 	mutableNames := map[string]bool{
-		"MANIFEST":               true,
-		"OPTIONS":                true,
-		"marker.format-version":  true,
-		"marker.manifest":        true,
-		"CURRENT":                true,
+		"MANIFEST":              true,
+		"OPTIONS":               true,
+		"marker.format-version": true,
+		"marker.manifest":       true,
+		"CURRENT":               true,
 	}
 
 	isMutable := func(name string) bool {
@@ -596,7 +642,6 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	}
 	e.uploadedMu.Unlock()
 
-	// Build manifest with checksums and file inventory.
 	mf := Manifest{
 		Version:     e.manifestVersion + 1,
 		PrevVersion: e.manifestVersion,
@@ -621,17 +666,17 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("engine: encoding manifest: %w", err)
 	}
 
-	// Write the current manifest.
-	if err := e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
-		return fmt.Errorf("engine: writing manifest: %w", err)
-	}
-
-	// Write versioned manifest for rollback history.
+	// Write versioned manifest first, then update the current manifest pointer.
+	// If the versioned write succeeds but the current pointer write fails,
+	// the versioned copy can be used for recovery.
 	if err := e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing versioned manifest: %w", err)
 	}
 
-	// Prune old manifest versions.
+	if err := e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
+		return fmt.Errorf("engine: writing manifest: %w", err)
+	}
+
 	oldVersions, err := e.store.List(ctx, e.manifestVersionsPrefix())
 	if err == nil && len(oldVersions) > maxManifestHistory {
 		sort.Strings(oldVersions)
@@ -653,6 +698,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 }
 
 func (e *Engine) syncLoop(interval time.Duration) {
+	defer e.wg.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -661,8 +707,15 @@ func (e *Engine) syncLoop(interval time.Duration) {
 		case <-e.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := e.Sync(context.Background()); err != nil {
-				fmt.Fprintf(os.Stderr, "engine: sync error: %v\n", err)
+			if err := e.Sync(e.ctx); err != nil {
+				e.logger.Error("sync error", "error", err)
+				e.healthy.Store(false)
+				select {
+				case e.errCh <- fmt.Errorf("sync: %w", err):
+				default:
+				}
+			} else {
+				e.healthy.Store(true)
 			}
 			e.checkEviction()
 		}
@@ -683,11 +736,8 @@ func (e *Engine) checkEviction() {
 		return
 	}
 
-	// Trigger a full compaction to reduce SST count and reclaim space.
-	// Old SST files will be detected as stale by the next Sync and deleted
-	// from GCS.
-	db.Compact(context.Background(), nil, nil, true)
-	e.Sync(context.Background())
+	db.Compact(e.ctx, nil, nil, true)
+	e.Sync(e.ctx)
 }
 
 func (e *Engine) manifestPath() string {
@@ -707,9 +757,10 @@ func (e *Engine) dataPrefix() string {
 }
 
 // Close gracefully shuts down the engine, flushing data and uploading a final
-// checkpoint.
+// checkpoint. It waits for all background goroutines to finish.
 func (e *Engine) Close() error {
 	e.cancel()
+	e.wg.Wait()
 
 	if err := e.Sync(context.Background()); err != nil {
 		e.dbMu.RLock()

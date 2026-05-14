@@ -1,10 +1,46 @@
-testdata/
-/tmp/
-.DS_Store
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+pebble-bigtable
+cloudpebble
+test-recovery
+test-incremental
+test-eventual
+test-coldmiss
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+coverage.out
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
 *.swp
 *.swo
-*.backup
-/cmd/cloudpebble/cloudpebble
-/cmd/pebble-bigtable/pebble-bigtable
-/pebble-bigtable
-*.test
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoint directories (created during tests)
+checkpoint/
+*.wal
+
+# Local object store test data
+/tmp/cloudpebble-*
+/tmp/btdb
+/tmp/btobj
+
+# Go workspace
+go.work
+go.work.sum

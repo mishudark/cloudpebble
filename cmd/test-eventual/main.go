@@ -36,7 +36,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir: dir, Store: store, Namespace: ns, SyncInterval: 3600 * 1e9,
 		})
 		if err != nil {
@@ -62,7 +62,7 @@ func main() {
 			fmt.Printf("  %s\n", w)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:          dir,
 			Store:        store,
 			Namespace:    ns,

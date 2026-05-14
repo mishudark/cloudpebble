@@ -32,7 +32,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:       dir,
 			Store:     store,
 			Namespace: namespace,
@@ -71,7 +71,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		e, err := engine.Open(engine.Options{
+		e, err := engine.Open(context.Background(), engine.Options{
 			Dir:       dir,
 			Store:     store,
 			Namespace: namespace,

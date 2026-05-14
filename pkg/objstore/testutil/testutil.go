@@ -59,7 +59,7 @@ func testGetNotFound(t *testing.T, s objstore.Store) {
 	if err == nil {
 		t.Fatal("expected error for nonexistent key")
 	}
-	if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "NotFound") {
+	if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "NotFound") && !strings.Contains(err.Error(), "doesn't exist") {
 		t.Fatalf("error should indicate not found, got: %v", err)
 	}
 }
