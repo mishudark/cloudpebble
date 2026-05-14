@@ -104,4 +104,16 @@ func (s *Store) Exists(ctx context.Context, path string) (bool, error) {
 	return false, fmt.Errorf("local: checking exists %s: %w", path, err)
 }
 
+func (s *Store) Attrs(ctx context.Context, path string) (objstore.ObjectInfo, error) {
+	fi, err := os.Stat(s.path(path))
+	if err != nil {
+		return objstore.ObjectInfo{}, err
+	}
+	return objstore.ObjectInfo{
+		Path:      path,
+		Size:      fi.Size(),
+		CreatedAt: fi.ModTime(),
+	}, nil
+}
+
 func (s *Store) Close() error { return nil }

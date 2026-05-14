@@ -1,15 +1,17 @@
-// Package engine provides the top-level CloudPebble engine that combines a
-// local Pebble instance (read cache) with durable object storage (GCS WAL +
-// SSTs).
 package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -19,17 +21,38 @@ import (
 )
 
 const (
-	defaultSyncInterval = 30 * time.Second
-	manifestName        = "manifest"
-	dataDir             = "data"
-	ckptDir             = "checkpoint"
+	defaultSyncInterval      = 30 * time.Second
+	defaultColdMissThreshold = 3
+	manifestName             = "manifest"
+	dataDir                  = "data"
+	ckptDir                  = "checkpoint"
+	manifestsDir             = "manifests"
+	maxManifestHistory       = 10
 )
 
-// manifest is the metadata file stored in object storage that records the
-// last checkpoint version and the highest WAL sequence number covered by
-// that checkpoint.
-type manifest struct {
-	MaxWALSeq uint64 `json:"max_wal_seq"`
+// ConsistencyLevel controls the consistency guarantee on reads.
+type ConsistencyLevel int
+
+const (
+	ConsistencyStrong ConsistencyLevel = iota
+	ConsistencyEventual
+)
+
+// Manifest is the metadata file stored in object storage that records the
+// last checkpoint version, its file inventory with checksums, and the
+// highest WAL sequence number covered by that checkpoint.
+type Manifest struct {
+	Version     int              `json:"version"`
+	MaxWALSeq   uint64           `json:"max_wal_seq"`
+	CreatedAt   time.Time        `json:"created_at"`
+	PrevVersion int              `json:"prev_version"`
+	Files       []ManifestFile   `json:"files"`
+}
+
+type ManifestFile struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Checksum string `json:"checksum"` // SHA-256 hex
 }
 
 // Options configures an Engine.
@@ -40,31 +63,70 @@ type Options struct {
 	// Store is the object storage backend for durable data.
 	Store objstore.Store
 
-	// Namespace is the tenant/namespace identifier. Data is stored under
-	// {namespace}/ in object storage.
+	// Namespace is the tenant/namespace identifier.
 	Namespace string
 
 	// SyncInterval controls how often local SSTs are uploaded to object
 	// storage. If zero, defaults to 30 seconds.
 	SyncInterval time.Duration
 
+	// ColdMissThreshold is the number of consecutive cache misses before
+	// the engine triggers a recovery download from object storage.
+	// Zero disables automatic cold-miss recovery. Default: 3.
+	ColdMissThreshold int
+
+	// Consistency sets the read consistency level. Default: ConsistencyStrong.
+	Consistency ConsistencyLevel
+
+	// OrphanWALTTL is the duration after which WAL objects with sequence
+	// numbers that have not been applied locally are deleted as orphans.
+	// Zero disables orphan cleanup. Default: 1 hour.
+	OrphanWALTTL time.Duration
+
+	// BatchWindow controls WAL batching. Concurrent writes within this
+	// window are coalesced into a single GCS WAL object. Zero disables
+	// batching. Default: 1s (matching turbopuffer's 1 WAL entry/sec).
+	BatchWindow time.Duration
+
+	// MaxLocalBytes is the soft limit on the local Pebble cache size. When
+	// exceeded, the engine compacts older data to reduce disk usage. Zero
+	// means no limit. Default: 0.
+	MaxLocalBytes int64
+
 	// PebbleOptions are passed through to the underlying Pebble instance.
 	// The Engine forces DisableWAL to true regardless of this setting.
 	PebbleOptions *pebble.Options
 }
 
-// Engine is the core CloudPebble instance for a single namespace. It
-// provides a key-value API backed by a local Pebble cache with durable
-// persistence in object storage.
+// Engine is the core CloudPebble instance for a single namespace.
 type Engine struct {
-	ns      string
-	store   objstore.Store
-	walMgr  *walcloud.Manager
-	db      *pebble.DB
+	ns       string
+	store    objstore.Store
+	walMgr   *walcloud.Manager
 	localDir string
+
+	consistency ConsistencyLevel
+
+	dbMu sync.RWMutex
+	db   *pebble.DB
 
 	mu        sync.Mutex
 	maxWALSeq uint64
+
+	uploadedMu    sync.Mutex
+	uploadedFiles map[string]struct{}
+
+	orphanWALTTL time.Duration
+	batchWindow  time.Duration
+
+	maxLocalBytes   int64
+	manifestVersion int
+
+	metrics Metrics
+
+	coldMissCount  atomic.Int64
+	recovering     atomic.Bool
+	coldMissThresh int64
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -84,13 +146,22 @@ func Open(opts Options) (*Engine, error) {
 	if opts.SyncInterval <= 0 {
 		opts.SyncInterval = defaultSyncInterval
 	}
+	if opts.ColdMissThreshold <= 0 {
+		opts.ColdMissThreshold = defaultColdMissThreshold
+	}
+	if opts.OrphanWALTTL <= 0 {
+		opts.OrphanWALTTL = 1 * time.Hour
+	}
+	if opts.BatchWindow <= 0 {
+		opts.BatchWindow = 1 * time.Second
+	}
 	if opts.PebbleOptions == nil {
 		opts.PebbleOptions = &pebble.Options{}
 	}
 	opts.PebbleOptions.EnsureDefaults()
 	opts.PebbleOptions.DisableWAL = true
 
-	walMgr, err := walcloud.NewManager(opts.Store, opts.Namespace)
+	walMgr, err := walcloud.NewManager(opts.Store, opts.Namespace, opts.BatchWindow)
 	if err != nil {
 		return nil, fmt.Errorf("engine: creating WAL manager: %w", err)
 	}
@@ -100,13 +171,19 @@ func Open(opts Options) (*Engine, error) {
 	}
 
 	e := &Engine{
-		ns:      opts.Namespace,
-		store:   opts.Store,
-		walMgr:  walMgr,
-		localDir: opts.Dir,
+		ns:             opts.Namespace,
+		store:          opts.Store,
+		walMgr:         walMgr,
+		localDir:       opts.Dir,
+		consistency:    opts.Consistency,
+		orphanWALTTL:   opts.OrphanWALTTL,
+		batchWindow:    opts.BatchWindow,
+		maxLocalBytes:  opts.MaxLocalBytes,
+		uploadedFiles:  make(map[string]struct{}),
+		coldMissThresh: int64(opts.ColdMissThreshold),
 	}
 
-	if err := e.recover(context.Background(), opts); err != nil {
+	if err := e.recover(context.Background()); err != nil {
 		return nil, fmt.Errorf("engine: recovery: %w", err)
 	}
 
@@ -116,55 +193,77 @@ func Open(opts Options) (*Engine, error) {
 
 	go e.syncLoop(opts.SyncInterval)
 
+	if e.consistency == ConsistencyEventual {
+		go e.walReplayLoop()
+	}
+
 	return e, nil
 }
 
-// recover downloads checkpoint data from object storage (if any) and replays
-// uncommitted WAL entries.
-func (e *Engine) recover(ctx context.Context, opts Options) error {
-	manifestBytes, err := opts.Store.Get(ctx, e.manifestPath())
+// recover downloads checkpoint data from object storage (if any) and
+// replays uncommitted WAL entries. It opens Pebble with the recovered
+// state. Called both at Open() and during cold-miss recovery.
+func (e *Engine) recover(ctx context.Context) error {
+	manifestBytes, err := e.store.Get(ctx, e.manifestPath())
 	hasManifest := err == nil
 
+	e.uploadedMu.Lock()
+	e.uploadedFiles = make(map[string]struct{})
+	e.uploadedMu.Unlock()
+
 	if hasManifest {
-		var m manifest
+		var m Manifest
 		if err := json.Unmarshal(manifestBytes, &m); err != nil {
-			return fmt.Errorf("decoding manifest: %w", err)
+			// Try old format: {MaxWALSeq: N}
+			var old struct{ MaxWALSeq uint64 }
+			if err2 := json.Unmarshal(manifestBytes, &old); err2 != nil {
+				return fmt.Errorf("decoding manifest: %w", err)
+			}
+			m.MaxWALSeq = old.MaxWALSeq
 		}
 
+		e.manifestVersion = m.Version
+
 		dataPrefix := e.dataPrefix()
-		files, err := opts.Store.List(ctx, dataPrefix)
+		files, err := e.store.List(ctx, dataPrefix)
 		if err != nil {
 			return fmt.Errorf("listing data files: %w", err)
 		}
 		for _, f := range files {
 			localName := filepath.Base(f)
-			localPath := filepath.Join(opts.Dir, localName)
-			data, err := opts.Store.Get(ctx, f)
+			localPath := filepath.Join(e.localDir, localName)
+			data, err := e.store.Get(ctx, f)
 			if err != nil {
 				return fmt.Errorf("downloading %s: %w", f, err)
 			}
 			if err := os.WriteFile(localPath, data, 0644); err != nil {
 				return fmt.Errorf("writing local %s: %w", localPath, err)
 			}
+			e.uploadedMu.Lock()
+			e.uploadedFiles[f] = struct{}{}
+			e.uploadedMu.Unlock()
 		}
 
 		e.maxWALSeq = m.MaxWALSeq
 	}
 
-	db, err := pebble.Open(opts.Dir, opts.PebbleOptions)
+	db, err := pebble.Open(e.localDir, &pebble.Options{
+		DisableWAL: true,
+	})
 	if err != nil {
 		return fmt.Errorf("opening pebble: %w", err)
 	}
-	e.db = db
 
-	if hasManifest {
+	// Close previous db if this is a mid-life recovery (cold miss trigger).
+	e.dbMu.Lock()
+	if e.db != nil {
+		e.db.Close()
+	}
+	e.db = db
+	e.dbMu.Unlock()
+
+	if e.consistency == ConsistencyStrong {
 		if err := e.replayWALs(ctx); err != nil {
-			db.Close()
-			return fmt.Errorf("replaying WALs: %w", err)
-		}
-	} else {
-		if err := e.replayWALs(ctx); err != nil {
-			db.Close()
 			return fmt.Errorf("replaying WALs: %w", err)
 		}
 	}
@@ -205,6 +304,72 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 	return nil
 }
 
+// walReplayLoop periodically replays WAL entries that were skipped during
+// eventual-consistency open. This self-heals the node by gradually catching
+// it up to the latest durable state.
+func (e *Engine) walReplayLoop() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := e.replayWALs(context.Background()); err != nil {
+				fmt.Fprintf(os.Stderr, "engine: WAL replay error: %v\n", err)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Write path
+// ---------------------------------------------------------------------------
+
+func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uint64, error) {
+	data := batch.Repr()
+
+	walStart := time.Now()
+	seq, done, err := e.walMgr.WriteRecord(ctx, data)
+	e.metrics.WALWriteLatencyNs.Add(time.Since(walStart).Nanoseconds())
+	if err != nil {
+		return 0, fmt.Errorf("engine: writing WAL: %w", err)
+	}
+	e.metrics.WALObjectsWritten.Add(1)
+	e.metrics.BytesWrittenWAL.Add(int64(len(data)))
+
+	// Apply to local Pebble immediately. Writes are visible before the
+	// GCS commit, trading a small window of potential data loss (if the
+	// process crashes before the GCS write completes) for low latency.
+	applyStart := time.Now()
+	e.dbMu.RLock()
+	err = e.db.Apply(batch, pebble.NoSync)
+	e.dbMu.RUnlock()
+	e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
+	if err != nil {
+		return 0, fmt.Errorf("engine: applying: %w", err)
+	}
+
+	// Wait for GCS durability if batching is enabled.
+	if done != nil {
+		select {
+		case gcsErr := <-done:
+			if gcsErr != nil {
+				return 0, fmt.Errorf("engine: WAL durability: %w", gcsErr)
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+
+	e.mu.Lock()
+	if seq > e.maxWALSeq {
+		e.maxWALSeq = seq
+	}
+	e.mu.Unlock()
+	return seq, nil
+}
+
 // Set stores a key-value pair. The write is durably committed to object
 // storage before returning.
 func (e *Engine) Set(ctx context.Context, key, value []byte) error {
@@ -215,36 +380,11 @@ func (e *Engine) Set(ctx context.Context, key, value []byte) error {
 		return fmt.Errorf("engine: building set: %w", err)
 	}
 
-	data := batch.Repr()
-
-	seq, err := e.walMgr.WriteRecord(ctx, data)
-	if err != nil {
-		return fmt.Errorf("engine: writing WAL: %w", err)
+	_, err := e.writeWALAndApply(ctx, batch)
+	if err == nil {
+		e.metrics.Sets.Add(1)
 	}
-
-	if err := e.db.Apply(batch, pebble.NoSync); err != nil {
-		return fmt.Errorf("engine: applying: %w", err)
-	}
-
-	e.mu.Lock()
-	if seq > e.maxWALSeq {
-		e.maxWALSeq = seq
-	}
-	e.mu.Unlock()
-
-	return nil
-}
-
-// Get retrieves the value for a key.
-func (e *Engine) Get(key []byte) ([]byte, error) {
-	val, closer, err := e.db.Get(key)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]byte, len(val))
-	copy(result, val)
-	closer.Close()
-	return result, nil
+	return err
 }
 
 // Delete removes a key. The deletion is durably committed to object storage
@@ -257,69 +397,128 @@ func (e *Engine) Delete(ctx context.Context, key []byte) error {
 		return fmt.Errorf("engine: building delete: %w", err)
 	}
 
-	data := batch.Repr()
-
-	seq, err := e.walMgr.WriteRecord(ctx, data)
-	if err != nil {
-		return fmt.Errorf("engine: writing WAL: %w", err)
+	_, err := e.writeWALAndApply(ctx, batch)
+	if err == nil {
+		e.metrics.Deletes.Add(1)
 	}
-
-	if err := e.db.Apply(batch, pebble.NoSync); err != nil {
-		return fmt.Errorf("engine: applying: %w", err)
-	}
-
-	e.mu.Lock()
-	if seq > e.maxWALSeq {
-		e.maxWALSeq = seq
-	}
-	e.mu.Unlock()
-
-	return nil
+	return err
 }
 
 // Apply writes a pre-built batch durably. The batch is committed to object
 // storage WAL before being applied locally.
 func (e *Engine) Apply(ctx context.Context, batch *pebble.Batch) error {
-	data := batch.Repr()
-
-	seq, err := e.walMgr.WriteRecord(ctx, data)
-	if err != nil {
-		return fmt.Errorf("engine: writing WAL: %w", err)
-	}
-
-	if err := e.db.Apply(batch, pebble.NoSync); err != nil {
-		return fmt.Errorf("engine: applying: %w", err)
-	}
-
-	e.mu.Lock()
-	if seq > e.maxWALSeq {
-		e.maxWALSeq = seq
-	}
-	e.mu.Unlock()
-
-	return nil
+	_, err := e.writeWALAndApply(ctx, batch)
+	return err
 }
 
-// DB returns the underlying local Pebble instance. Callers may use this for
-// advanced operations like iteration, snapshots, or custom compaction
-// control.
+// ---------------------------------------------------------------------------
+// Read path with cold-miss fallback
+// ---------------------------------------------------------------------------
+
+// Get retrieves the value for a key. If the key is not found in the local
+// cache and the cold-miss threshold is exceeded, the engine triggers a
+// background recovery from object storage.
+func (e *Engine) Get(key []byte) ([]byte, error) {
+	e.dbMu.RLock()
+	db := e.db
+	e.dbMu.RUnlock()
+
+	val, closer, err := db.Get(key)
+	if err != nil {
+		e.metrics.Gets.Add(1)
+		if err == pebble.ErrNotFound {
+			e.metrics.GetMisses.Add(1)
+			if e.coldMissThresh > 0 && !e.recovering.Load() {
+				n := e.coldMissCount.Add(1)
+				if n >= e.coldMissThresh {
+					e.triggerColdRecovery()
+				}
+			}
+		}
+		return nil, err
+	}
+	e.metrics.Gets.Add(1)
+	e.metrics.GetHits.Add(1)
+	e.coldMissCount.Store(0)
+	result := make([]byte, len(val))
+	copy(result, val)
+	closer.Close()
+	return result, nil
+}
+
+func (e *Engine) triggerColdRecovery() {
+	if !e.recovering.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer e.recovering.Store(false)
+		defer e.coldMissCount.Store(0)
+
+		e.metrics.ColdRecoveries.Add(1)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		if err := e.recover(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "engine: cold recovery failed: %v\n", err)
+		}
+	}()
+}
+
+// ---------------------------------------------------------------------------
+// DB access
+// ---------------------------------------------------------------------------
+
+// DB returns the underlying local Pebble instance. Callers must NOT close
+// the returned DB. The Engine may swap the DB during cold-miss recovery.
 func (e *Engine) DB() *pebble.DB {
+	e.dbMu.RLock()
+	defer e.dbMu.RUnlock()
 	return e.db
 }
+
+// Metrics returns the engine's operational metrics. All counters are safe
+// for concurrent access.
+func (e *Engine) Metrics() *Metrics {
+	return &e.metrics
+}
+
+// ---------------------------------------------------------------------------
+// Sync (flush + upload checkpoint)
+// ---------------------------------------------------------------------------
 
 // Sync flushes the local Pebble instance and uploads a consistent checkpoint
 // to object storage. After Sync returns, all data up to the current point is
 // durably stored in object storage as both WAL entries and SST files.
-func (e *Engine) Sync(ctx context.Context) error {
-	if err := e.db.Flush(); err != nil {
+// Only new or changed SST files are uploaded (incremental).
+func (e *Engine) Sync(ctx context.Context) (err error) {
+	start := time.Now()
+	defer func() {
+		e.metrics.SyncLatencyNs.Add(time.Since(start).Nanoseconds())
+		e.metrics.SyncCalls.Add(1)
+		if err != nil {
+			e.metrics.SyncFailures.Add(1)
+		}
+	}()
+
+	e.dbMu.RLock()
+	db := e.db
+	e.dbMu.RUnlock()
+
+	// Use async flush so new writes can proceed into the next memtable
+	// while the current one is flushed to SSTs. Only the checkpoint
+	// step blocks writes (briefly, for the file copy).
+	flushDone, err := db.AsyncFlush()
+	if err != nil {
 		return fmt.Errorf("engine: flush: %w", err)
 	}
+	<-flushDone
 
 	checkpointDir := filepath.Join(e.localDir, ckptDir)
 	os.RemoveAll(checkpointDir)
 	defer os.RemoveAll(checkpointDir)
 
-	if err := e.db.Checkpoint(checkpointDir); err != nil {
+	if err := db.Checkpoint(checkpointDir); err != nil {
 		return fmt.Errorf("engine: checkpoint: %w", err)
 	}
 
@@ -331,54 +530,122 @@ func (e *Engine) Sync(ctx context.Context) error {
 	e.mu.Lock()
 	currentSeq := e.maxWALSeq
 	dataPrefix := e.dataPrefix()
-
-	existingFiles, err := e.store.List(ctx, dataPrefix)
-	if err != nil {
-		e.mu.Unlock()
-		return fmt.Errorf("engine: listing existing data files: %w", err)
-	}
-	existingSet := make(map[string]bool, len(existingFiles))
-	for _, f := range existingFiles {
-		existingSet[filepath.Base(f)] = true
-	}
 	e.mu.Unlock()
 
-	checkpointFiles := make(map[string]bool)
+	// Files that can change content without changing name (MANIFEST,
+	// OPTIONS, markers) must always be uploaded. SST files are immutable
+	// (new file number on each compaction/flush) so they can be skipped
+	// by name.
+	mutableNames := map[string]bool{
+		"MANIFEST":               true,
+		"OPTIONS":                true,
+		"marker.format-version":  true,
+		"marker.manifest":        true,
+		"CURRENT":                true,
+	}
+
+	isMutable := func(name string) bool {
+		for prefix := range mutableNames {
+			if strings.HasPrefix(name, prefix) {
+				return true
+			}
+		}
+		return false
+	}
+
+	checkpointFiles := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		checkpointFiles[entry.Name()] = true
+
+		remotePath := filepath.ToSlash(filepath.Join(dataPrefix, entry.Name()))
+
+		e.uploadedMu.Lock()
+		_, alreadyUploaded := e.uploadedFiles[remotePath]
+		e.uploadedMu.Unlock()
+
+		if alreadyUploaded && !isMutable(entry.Name()) {
+			continue
+		}
 
 		localPath := filepath.Join(checkpointDir, entry.Name())
 		data, err := os.ReadFile(localPath)
 		if err != nil {
 			return fmt.Errorf("engine: reading checkpoint file %s: %w", entry.Name(), err)
 		}
-		remotePath := filepath.ToSlash(filepath.Join(dataPrefix, entry.Name()))
 		if err := e.store.Put(ctx, remotePath, data); err != nil {
 			return fmt.Errorf("engine: uploading %s: %w", entry.Name(), err)
 		}
+
+		e.uploadedMu.Lock()
+		e.uploadedFiles[remotePath] = struct{}{}
+		e.uploadedMu.Unlock()
 	}
 
-	for f := range existingSet {
-		if !checkpointFiles[f] {
-			remotePath := filepath.ToSlash(filepath.Join(dataPrefix, f))
+	e.uploadedMu.Lock()
+	for remotePath := range e.uploadedFiles {
+		base := filepath.Base(remotePath)
+		if !checkpointFiles[base] {
 			if err := e.store.Delete(ctx, remotePath); err != nil {
-				return fmt.Errorf("engine: deleting stale file %s: %w", f, err)
+				e.uploadedMu.Unlock()
+				return fmt.Errorf("engine: deleting stale file %s: %w", base, err)
 			}
+			delete(e.uploadedFiles, remotePath)
 		}
 	}
+	e.uploadedMu.Unlock()
 
-	m := manifest{MaxWALSeq: currentSeq}
-	manifestBytes, err := json.Marshal(m)
+	// Build manifest with checksums and file inventory.
+	mf := Manifest{
+		Version:     e.manifestVersion + 1,
+		PrevVersion: e.manifestVersion,
+		MaxWALSeq:   currentSeq,
+		CreatedAt:   time.Now(),
+	}
+	for _, entry := range entries {
+		localPath := filepath.Join(checkpointDir, entry.Name())
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			return fmt.Errorf("engine: reading %s for checksum: %w", entry.Name(), err)
+		}
+		h := sha256.Sum256(data)
+		mf.Files = append(mf.Files, ManifestFile{
+			Name:     entry.Name(),
+			Size:     int64(len(data)),
+			Checksum: hex.EncodeToString(h[:]),
+		})
+	}
+	manifestBytes, err := json.Marshal(mf)
 	if err != nil {
 		return fmt.Errorf("engine: encoding manifest: %w", err)
 	}
+
+	// Write the current manifest.
 	if err := e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing manifest: %w", err)
 	}
 
-	if _, err := e.walMgr.GC(ctx, currentSeq); err != nil {
+	// Write versioned manifest for rollback history.
+	if err := e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
+		return fmt.Errorf("engine: writing versioned manifest: %w", err)
+	}
+
+	// Prune old manifest versions.
+	oldVersions, err := e.store.List(ctx, e.manifestVersionsPrefix())
+	if err == nil && len(oldVersions) > maxManifestHistory {
+		sort.Strings(oldVersions)
+		for _, v := range oldVersions[:len(oldVersions)-maxManifestHistory] {
+			e.store.Delete(ctx, v)
+		}
+	}
+
+	e.manifestVersion = mf.Version
+
+	deleted, err := e.walMgr.GC(ctx, currentSeq, e.orphanWALTTL)
+	if err != nil {
+		e.metrics.SyncFailures.Add(1)
 		return fmt.Errorf("engine: WAL GC: %w", err)
 	}
+	e.metrics.WALObjectsGCd.Add(int64(deleted))
 
 	return nil
 }
@@ -395,12 +662,42 @@ func (e *Engine) syncLoop(interval time.Duration) {
 			if err := e.Sync(context.Background()); err != nil {
 				fmt.Fprintf(os.Stderr, "engine: sync error: %v\n", err)
 			}
+			e.checkEviction()
 		}
 	}
 }
 
+func (e *Engine) checkEviction() {
+	if e.maxLocalBytes <= 0 {
+		return
+	}
+
+	e.dbMu.RLock()
+	db := e.db
+	e.dbMu.RUnlock()
+
+	m := db.Metrics()
+	if m.DiskSpaceUsage() <= uint64(e.maxLocalBytes) {
+		return
+	}
+
+	// Trigger a full compaction to reduce SST count and reclaim space.
+	// Old SST files will be detected as stale by the next Sync and deleted
+	// from GCS.
+	db.Compact(context.Background(), nil, nil, true)
+	e.Sync(context.Background())
+}
+
 func (e *Engine) manifestPath() string {
 	return filepath.ToSlash(filepath.Join(e.ns, manifestName))
+}
+
+func (e *Engine) manifestVersionPath(v int) string {
+	return filepath.ToSlash(filepath.Join(e.ns, manifestsDir, fmt.Sprintf("%06d.json", v)))
+}
+
+func (e *Engine) manifestVersionsPrefix() string {
+	return filepath.ToSlash(filepath.Join(e.ns, manifestsDir)) + "/"
 }
 
 func (e *Engine) dataPrefix() string {
@@ -413,8 +710,14 @@ func (e *Engine) Close() error {
 	e.cancel()
 
 	if err := e.Sync(context.Background()); err != nil {
-		e.db.Close()
+		e.dbMu.RLock()
+		if e.db != nil {
+			e.db.Close()
+		}
+		e.dbMu.RUnlock()
 		return fmt.Errorf("engine: final sync: %w", err)
 	}
+	e.dbMu.RLock()
+	defer e.dbMu.RUnlock()
 	return e.db.Close()
 }

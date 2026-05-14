@@ -114,6 +114,18 @@ func (s *Store) Exists(ctx context.Context, path string) (bool, error) {
 	return true, nil
 }
 
+func (s *Store) Attrs(ctx context.Context, path string) (objstore.ObjectInfo, error) {
+	attrs, err := s.client.Bucket(s.bucket).Object(s.fullPath(path)).Attrs(ctx)
+	if err != nil {
+		return objstore.ObjectInfo{}, err
+	}
+	return objstore.ObjectInfo{
+		Path:      path,
+		Size:      attrs.Size,
+		CreatedAt: attrs.Created,
+	}, nil
+}
+
 func (s *Store) Close() error {
 	return s.client.Close()
 }

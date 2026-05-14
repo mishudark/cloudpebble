@@ -9,7 +9,15 @@ package objstore
 import (
 	"context"
 	"io"
+	"time"
 )
+
+// ObjectInfo holds metadata about an object in the store.
+type ObjectInfo struct {
+	Path      string
+	Size      int64
+	CreatedAt time.Time
+}
 
 // Store is a minimal object storage interface. Backends implement Put, Get,
 // Delete, List, and Exists against an implicit root (e.g. a GCS bucket or a
@@ -34,4 +42,8 @@ type Store interface {
 
 	// Exists reports whether an object exists at path.
 	Exists(ctx context.Context, path string) (bool, error)
+
+	// Attrs returns metadata about the object at path, including its creation
+	// time and size. Returns an error if the object does not exist.
+	Attrs(ctx context.Context, path string) (ObjectInfo, error)
 }
