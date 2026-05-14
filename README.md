@@ -219,7 +219,7 @@ Timestamps are inverted (`math.MaxInt64 - ts`) so the newest cells sort first un
 | `SampleRowKeys` | Done | Split-key sampling from SST file boundaries |
 | `PingAndWarm` | Done | Health check + cache warming |
 | `OpenTable` | Done | Session-based bidirectional streaming protocol |
-| `ReadModifyWriteRow` | Stub | Returns `Unimplemented` |
+| `ReadModifyWriteRow` | Done | Atomic append/increment via IndexedBatch |
 | Change stream RPCs | Stub | Returns `Unimplemented` |
 | SQL RPCs | Stub | Returns `Unimplemented` |
 

@@ -9,6 +9,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 )
 
 // MutateRow applies a set of mutations to a single row atomically.
@@ -255,16 +256,16 @@ func applyDeleteFromRow(batch *pebble.Batch, rowKey []byte) error {
 	return batch.DeleteRange(rp, rowEndKey(rp), nil)
 }
 
-// toBigtableStatus converts a Go error to a bigtablepb.Status.
-func toBigtableStatus(err error) *bigtablepb.Status {
+// toBigtableStatus converts a Go error to a rpcstatus.Status.
+func toBigtableStatus(err error) *rpcstatus.Status {
 	s, _ := status.FromError(err)
-	return &bigtablepb.Status{
+	return &rpcstatus.Status{
 		Code:    int32(s.Code()),
 		Message: s.Message(),
 	}
 }
 
-// okStatus returns a bigtablepb.Status representing OK.
-func okStatus() *bigtablepb.Status {
-	return &bigtablepb.Status{Code: int32(codes.OK)}
+// okStatus returns a rpcstatus.Status representing OK.
+func okStatus() *rpcstatus.Status {
+	return &rpcstatus.Status{Code: int32(codes.OK)}
 }

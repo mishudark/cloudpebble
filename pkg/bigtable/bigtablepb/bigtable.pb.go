@@ -21,6 +21,7 @@
 package bigtablepb
 
 import (
+	status "google.golang.org/genproto/googleapis/rpc/status"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
@@ -2360,7 +2361,7 @@ type MutateRowsResponse_Entry struct {
 	// Depending on how requests are batched during execution, it is possible
 	// for one Entry to fail due to an error with another Entry. In the event
 	// that this occurs, the same error will be reported for both entries.
-	Status        *Status `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	Status        *status.Status `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2402,7 +2403,7 @@ func (x *MutateRowsResponse_Entry) GetIndex() int64 {
 	return 0
 }
 
-func (x *MutateRowsResponse_Entry) GetStatus() *Status {
+func (x *MutateRowsResponse_Entry) GetStatus() *status.Status {
 	if x != nil {
 		return x.Status
 	}
@@ -2695,7 +2696,7 @@ func (x *ReadChangeStreamResponse_Heartbeat) GetEstimatedLowWatermark() *timesta
 type ReadChangeStreamResponse_CloseStream struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The status of the stream.
-	Status *Status `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	Status *status.Status `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
 	// If non-empty, contains the information needed to resume reading their
 	// associated partitions.
 	ContinuationTokens []*StreamContinuationToken `protobuf:"bytes,2,rep,name=continuation_tokens,json=continuationTokens,proto3" json:"continuation_tokens,omitempty"`
@@ -2737,7 +2738,7 @@ func (*ReadChangeStreamResponse_CloseStream) Descriptor() ([]byte, []int) {
 	return file_google_bigtable_v2_bigtable_proto_rawDescGZIP(), []int{18, 3}
 }
 
-func (x *ReadChangeStreamResponse_CloseStream) GetStatus() *Status {
+func (x *ReadChangeStreamResponse_CloseStream) GetStatus() *status.Status {
 	if x != nil {
 		return x.Status
 	}
@@ -3163,7 +3164,7 @@ var file_google_bigtable_v2_bigtable_proto_goTypes = []any{
 	(*PartialResultSet)(nil),              // 48: google.bigtable.v2.PartialResultSet
 	(*wrapperspb.StringValue)(nil),        // 49: google.protobuf.StringValue
 	(*wrapperspb.BytesValue)(nil),         // 50: google.protobuf.BytesValue
-	(*Status)(nil),                        // 51: google.rpc.Status
+	(*status.Status)(nil),                 // 51: google.rpc.Status
 	(*StreamContinuationToken)(nil),       // 52: google.bigtable.v2.StreamContinuationToken
 	(*Value)(nil),                         // 53: google.bigtable.v2.Value
 	(*Type)(nil),                          // 54: google.bigtable.v2.Type
@@ -3275,7 +3276,6 @@ func file_google_bigtable_v2_bigtable_proto_init() {
 	file_google_bigtable_v2_request_stats_proto_init()
 	file_google_bigtable_v2_session_proto_init()
 	file_google_bigtable_v2_types_proto_init()
-	file_google_rpc_status_proto_init()
 	file_google_bigtable_v2_bigtable_proto_msgTypes[7].OneofWrappers = []any{}
 	file_google_bigtable_v2_bigtable_proto_msgTypes[17].OneofWrappers = []any{
 		(*ReadChangeStreamRequest_StartTime)(nil),

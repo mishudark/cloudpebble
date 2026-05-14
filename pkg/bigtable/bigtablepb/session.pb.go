@@ -21,6 +21,7 @@
 package bigtablepb
 
 import (
+	status "google.golang.org/genproto/googleapis/rpc/status"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	descriptorpb "google.golang.org/protobuf/types/descriptorpb"
@@ -1865,8 +1866,8 @@ type ErrorResponse struct {
 	RpcId       int64               `protobuf:"varint,1,opt,name=rpc_id,json=rpcId,proto3" json:"rpc_id,omitempty"`
 	ClusterInfo *ClusterInformation `protobuf:"bytes,2,opt,name=cluster_info,json=clusterInfo,proto3" json:"cluster_info,omitempty"`
 	// The error from the vRPC and any retry information to consider.
-	Status        *Status    `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
-	RetryInfo     *RetryInfo `protobuf:"bytes,4,opt,name=retry_info,json=retryInfo,proto3" json:"retry_info,omitempty"`
+	Status        *status.Status `protobuf:"bytes,3,opt,name=status,proto3" json:"status,omitempty"`
+	RetryInfo     *RetryInfo     `protobuf:"bytes,4,opt,name=retry_info,json=retryInfo,proto3" json:"retry_info,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1915,7 +1916,7 @@ func (x *ErrorResponse) GetClusterInfo() *ClusterInformation {
 	return nil
 }
 
-func (x *ErrorResponse) GetStatus() *Status {
+func (x *ErrorResponse) GetStatus() *status.Status {
 	if x != nil {
 		return x.Status
 	}
@@ -3893,7 +3894,7 @@ var file_google_bigtable_v2_session_proto_goTypes = []any{
 	(*SessionRefreshConfig_Metadata)(nil),                                                // 52: google.bigtable.v2.SessionRefreshConfig.Metadata
 	(*durationpb.Duration)(nil),                                                          // 53: google.protobuf.Duration
 	(*FeatureFlags)(nil),                                                                 // 54: google.bigtable.v2.FeatureFlags
-	(*Status)(nil),                                                                       // 55: google.rpc.Status
+	(*status.Status)(nil),                                                                // 55: google.rpc.Status
 	(*RetryInfo)(nil),                                                                    // 56: google.rpc.RetryInfo
 	(*RowFilter)(nil),                                                                    // 57: google.bigtable.v2.RowFilter
 	(*Row)(nil),                                                                          // 58: google.bigtable.v2.Row
@@ -3989,7 +3990,6 @@ func file_google_bigtable_v2_session_proto_init() {
 	file_google_bigtable_v2_feature_flags_proto_init()
 	file_google_bigtable_v2_request_stats_proto_init()
 	file_google_rpc_error_details_proto_init()
-	file_google_rpc_status_proto_init()
 	file_google_bigtable_v2_session_proto_msgTypes[1].OneofWrappers = []any{
 		(*LoadBalancingOptions_LeastInFlight_)(nil),
 		(*LoadBalancingOptions_PeakEwma_)(nil),

@@ -152,10 +152,6 @@ func (s *Server) OpenMaterializedView(stream grpc.BidiStreamingServer[bigtablepb
 // Stubs for unimplemented Phase 1 RPCs
 // ---------------------------------------------------------------------------
 
-func (s *Server) ReadModifyWriteRow(ctx context.Context, req *bigtablepb.ReadModifyWriteRowRequest) (*bigtablepb.ReadModifyWriteRowResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "ReadModifyWriteRow not yet implemented")
-}
-
 func (s *Server) GenerateInitialChangeStreamPartitions(req *bigtablepb.GenerateInitialChangeStreamPartitionsRequest, stream grpc.ServerStreamingServer[bigtablepb.GenerateInitialChangeStreamPartitionsResponse]) error {
 	return status.Error(codes.Unimplemented, "change streams not supported")
 }
