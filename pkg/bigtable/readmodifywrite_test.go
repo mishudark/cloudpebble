@@ -16,7 +16,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// newTestServer creates a Bigtable Server backed by a local objstore.
+// newTestServer creates a Bigtable Server backed by a local objstore
+// with WAL batching disabled for fast test execution.
 // The server is cleaned up automatically when the test ends.
 func newTestServer(t testing.TB) *Server {
 	t.Helper()
@@ -29,7 +30,14 @@ func newTestServer(t testing.TB) *Server {
 		t.Fatal(err)
 	}
 
-	s := NewServer(dir, store)
+	s := &Server{
+		dir:   dir,
+		store: store,
+		tables: make(map[string]*tableState),
+		engineOverrides: engine.Options{
+			BatchWindow: -1, // disable WAL batching for speed
+		},
+	}
 	t.Cleanup(func() { s.Close() })
 	return s
 }

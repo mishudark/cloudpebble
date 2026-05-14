@@ -28,6 +28,10 @@ type Server struct {
 
 	// Namespace suffix for table names. Table "foo" becomes namespace "bigtable/foo".
 	nsPrefix string
+
+	// engineOverrides are merged into engine.Open options in getEngine.
+	// Used by tests to disable WAL batching and speed up engine Open.
+	engineOverrides engine.Options
 }
 
 type tableState struct {
@@ -84,11 +88,15 @@ func (s *Server) getEngine(ctx context.Context, tableName string) (*engine.Engin
 		return ts.engine, nil
 	}
 
-	eng, err := engine.Open(engine.Options{
+	opts := engine.Options{
 		Dir:       s.dir + "/" + tableName,
 		Store:     s.store,
 		Namespace: s.tableNamespace(tableName),
-	})
+	}
+	if s.engineOverrides.BatchWindow != 0 {
+		opts.BatchWindow = s.engineOverrides.BatchWindow
+	}
+	eng, err := engine.Open(opts)
 	if err != nil {
 		return nil, fmt.Errorf("opening table %q: %w", tableName, err)
 	}

@@ -172,18 +172,30 @@ func columnEndKey(columnPrefix []byte) []byte {
 // encodeTimestampRangeBounds returns start and end keys for a column prefix
 // within a specific timestamp range. Bigtable's TimestampRange specifies
 // start_timestamp_micros (inclusive) and end_timestamp_micros (exclusive).
-// Since timestamps are inverted, larger timestamps produce smaller inverted values.
+// Since timestamps are inverted, larger timestamps produce smaller inverted
+// values. For ts ∈ [startTS, endTS) the inverted range is:
+//
+//	MaxInt64-endTS < inv <= MaxInt64-startTS
+//
+// Which maps to Pebble bounds [col+inv(endTS)+1, col+inv(startTS)).
+// The +1 on endTS ensures the exclusive end of the Bigtable range maps to
+// the inclusive start of the Pebble range, so cells at exactly endTS are
+// excluded. This addition is safe because endTS is always > 0 when called
+// (the caller substitutes time.Now().UnixMicro() for zero).
 func encodeTimestampRangeBounds(columnPrefix []byte, startTimestampMicros, endTimestampMicros int64) (start, end []byte) {
 	startInv := invertedTimestamp(startTimestampMicros)
 	endInv := invertedTimestamp(endTimestampMicros)
 
+	// Skip the cell at exactly endTS.
+	shiftedEnd := endInv + 1
+
 	startKey := make([]byte, len(columnPrefix)+8)
 	copy(startKey, columnPrefix)
-	binary.BigEndian.PutUint64(startKey[len(columnPrefix):], startInv)
+	binary.BigEndian.PutUint64(startKey[len(columnPrefix):], shiftedEnd)
 
 	endKey := make([]byte, len(columnPrefix)+8)
 	copy(endKey, columnPrefix)
-	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], endInv)
+	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], startInv)
 
 	return startKey, endKey
 }

@@ -152,7 +152,7 @@ func Open(opts Options) (*Engine, error) {
 	if opts.OrphanWALTTL <= 0 {
 		opts.OrphanWALTTL = 1 * time.Hour
 	}
-	if opts.BatchWindow <= 0 {
+	if opts.BatchWindow == 0 {
 		opts.BatchWindow = 1 * time.Second
 	}
 	if opts.PebbleOptions == nil {
