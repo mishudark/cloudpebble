@@ -127,7 +127,9 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 			chunkBuf = appendCellChunks(chunkBuf, rk, family, qualifier, ts, iter.Value())
 
 			if len(chunkBuf) >= cellChunkBufferSize {
-				resp := &bigtablepb.ReadRowsResponse{Chunks: chunkBuf}
+				resp := &bigtablepb.ReadRowsResponse{
+					Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
+				}
 				if len(lastScannedRowKey) > 0 {
 					resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
 				}
@@ -152,7 +154,9 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 
 	// Flush remaining chunks.
 	if len(chunkBuf) > 0 {
-		resp := &bigtablepb.ReadRowsResponse{Chunks: chunkBuf}
+		resp := &bigtablepb.ReadRowsResponse{
+			Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
+		}
 		if len(lastScannedRowKey) > 0 {
 			resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
 		}

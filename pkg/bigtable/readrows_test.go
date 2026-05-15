@@ -2,6 +2,7 @@ package bigtable
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/cockroachdb/pebble"
@@ -34,6 +35,68 @@ func populateTable(t *testing.T, s *Server, table string) {
 		if err := db.Set(key, []byte(d.val), pebble.NoSync); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestReadRowsValuesSurviveIteratorMove verifies that cell values returned
+// by ReadRows are correctly copied and not corrupted by Pebble's iterator
+// buffer reuse. The bug: cellChunk stored iter.Value() as a direct slice
+// reference, which is only valid until the next iterator operation. After
+// Flush forces data into SSTs, Pebble reuses block buffers across iterator
+// moves, causing previously-returned values to be silently overwritten.
+func TestReadRowsValuesSurviveIteratorMove(t *testing.T) {
+	s := newTestServer(t)
+	table := benchTable
+	eng := openTableEngine(t, s, table)
+	db := eng.DB()
+
+	// Write enough cells across rows to span multiple SST blocks.
+	for i := 0; i < 100; i++ {
+		row := fmt.Sprintf("row-%03d", i)
+		for j := 0; j < 5; j++ {
+			key := EncodeCellKey([]byte(row), "cf", []byte{byte(j)}, 1000+int64(j))
+			val := fmt.Sprintf("val-%03d-%d", i, j)
+			if err := db.Set(key, []byte(val), pebble.NoSync); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// ReadRows must return all 500 cells with correct values.
+	req := &bigtablepb.ReadRowsRequest{
+		TableName: table,
+	}
+	stream := newMockServerStream[*bigtablepb.ReadRowsResponse]()
+	if err := s.ReadRows(req, stream); err != nil {
+		t.Fatalf("ReadRows: %v", err)
+	}
+
+	var allChunks []*bigtablepb.ReadRowsResponse_CellChunk
+	for _, resp := range stream.sent {
+		allChunks = append(allChunks, resp.Chunks...)
+	}
+
+	got := make(map[string]int)
+	for _, c := range allChunks {
+		if c.GetCommitRow() || c.GetResetRow() {
+			continue
+		}
+		if len(c.Value) == 0 && c.ValueSize == 0 {
+			continue
+		}
+		got[string(c.Value)]++
+	}
+
+	for i := 0; i < 100; i++ {
+		for j := 0; j < 5; j++ {
+			want := fmt.Sprintf("val-%03d-%d", i, j)
+			if got[want] != 1 {
+				t.Fatalf("value %q: got count %d, want 1; total unique=%d, chunks=%d", want, got[want], len(got), len(allChunks))
+			}
+		}
+	}
+	if len(got) != 500 {
+		t.Fatalf("expected 500 unique values, got %d", len(got))
 	}
 }
 
