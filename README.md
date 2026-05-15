@@ -6,16 +6,16 @@ A local Pebble instance serves as a read-optimized NVMe/SSD cache. All writes ar
 
 ## Why CloudPebble
 
-- **Sub-millisecond cached reads.** Reads hit a local Pebble LSM tree  no network roundtrip.
-- **Immediate read-your-writes.** Writes are applied to the local memtable after GCS durability, so a single node sees its own writes instantly (strong consistency). 
-- **Embedded, not a service.** CloudPebble is a Go library, not a remote API. Deploy it alongside your application. No cold-start request routing, no load balancer, no per-query roundtrips — just a function call.
+- **Sub-millisecond cached reads.** Reads hit a local Pebble LSM tree — no network roundtrip.
+- **Immediate read-your-writes.** Writes are applied to the local memtable after object-storage durability, so a single node sees its own writes instantly (strong consistency).
+- **Embedded or networked.** Use CloudPebble as an in-process Go library (`pkg/engine`), or deploy it as a Bigtable-compatible gRPC server (`cmd/pebble-bigtable`) accessible from any Bigtable v2 SDK. Same engine, two deployment modes.
 - **Incremental checkpoints.** Only new or changed SST files are uploaded to object storage. Unchanged files are skipped, minimizing egress costs and sync time.
-- **WAL batching with configurable window.** Concurrent writes within the same window are coalesced into a single GCS object, amortizing the ~100ms GCS roundtrip across many writers. At 200ms batch window and 50k concurrent goroutines, extrapolated throughput exceeds 680k ops/sec.
-- **Bigtable v2 API over object storage.** Includes a production-grade gRPC server implementing MutateRow, ReadRows, CheckAndMutateRow, ReadModifyWriteRow, SampleRowKeys, and 14 RowFilter types — mapping Bigtable's wide-column model onto Pebble.
+- **WAL batching with configurable window.** Concurrent writes within the same window are coalesced into a single object-storage object, amortizing the ~100ms roundtrip across many writers. At 200ms batch window and 50k concurrent goroutines, extrapolated throughput exceeds 680k ops/sec.
+- **Production-grade Bigtable v2 API over object storage.** A gRPC server implementing MutateRow, ReadRows, CheckAndMutateRow, ReadModifyWriteRow, SampleRowKeys, and 16 RowFilter types — mapping Bigtable's wide-column model onto Pebble. Fully verified with the official `cloud.google.com/go/bigtable` client library across 33 integration tests + fuzz harness.
 - **Multi-backend object storage.** A minimal `Store` interface (Put/Get/Delete/List/Attrs) with GCS and local filesystem backends. Adding S3 or Azure Blob requires implementing a single interface.
 - **OpenTelemetry-native metrics.** Counters and latency histograms registered as OTEL observable instruments — no Prometheus bridge needed.
 - **Namespace isolation.** Each tenant gets its own prefix in object storage with independent Pebble DB, checkpoints, and WAL sequences. No cross-tenant data mixing.
-- **Crash recovery with cold-miss self-healing.** Nodes restart from GCS checkpoints and replay uncommitted WALs. A cold-miss detector triggers background recovery if consecutive cache misses suggest stale or missing local data.
+- **Crash recovery with cold-miss self-healing.** Nodes restart from object-storage checkpoints and replay uncommitted WALs. A cold-miss detector triggers background recovery if consecutive cache misses suggest stale or missing local data.
 
 ```
                         ╔═══════════ cloudpebble ═══════════════════╗
@@ -216,10 +216,10 @@ The implementation follows the same key-encoding approach described in [Pinteres
 
 ```
 Bigtable:  table / row_key / column_family / column_qualifier / timestamp → value
-Pebble:    [row_len:2][row_key][00][family_len:1][family][00][qual_len:2][qualifier][00][inverted_ts:8] → value
+Pebble:    [escaped_row_key][00][00][family_len:1][family][00][qual_len:2][qualifier][00][inverted_ts:8] → value
 ```
 
-Timestamps are inverted (`math.MaxInt64 - ts`) so the newest cells sort first under Pebble's ascending lexicographic order. Components are length-prefixed and separated by `0x00` sentinels, avoiding any escape-encoding overhead.
+Row keys use null-escape encoding (`0x00` → `0x00 0xFF`) with a `0x00 0x00` terminator, preserving lexicographic ordering for correct forward/reverse scans and prefix ranges. Timestamps are inverted (`math.MaxInt64 - ts`) so the newest cells sort first under Pebble's ascending lexicographic order.
 
 ### Supported RPCs
 
@@ -254,10 +254,10 @@ Timestamps are inverted (`math.MaxInt64 - ts`) so the newest cells sort first un
 | `cells_per_column_limit_filter` | Done |
 | `strip_value_transformer` | Done |
 | `apply_label_transformer` | Done |
-| `value_regex_filter` | Future |
-| `value_range_filter` | Future |
-| `row_sample_filter` | Future |
-| `sink` | Future |
+| `value_regex_filter` | Done |
+| `value_range_filter` | Done |
+| `row_sample_filter` | Done (crypto-random) |
+| `sink` | No (treated as pass_all) |
 
 ### Running the Bigtable Server
 
@@ -274,7 +274,7 @@ import (
     "google.golang.org/grpc/credentials/insecure"
 )
 
-conn, _ := grpc.Dial("localhost:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+conn, _ := grpc.NewClient("localhost:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
 client := bigtablepb.NewBigtableClient(conn)
 
 // Direct RPCs
@@ -421,12 +421,14 @@ To add a new backend, implement the `Store` interface and pass it to `engine.Opt
 
 ```
 cloudpebble/
+├── BIGTABLE_CLIENT_GUIDE.md           # Using the official Bigtable Go client
 ├── BIGTABLE_PLAN.md                   # Bigtable API implementation plan
 ├── DESIGN.md                         # Architecture design document
 ├── PLAN.md                           # Implementation plan (shortcuts → production)
 ├── cmd/
 │   ├── cloudpebble/main.go           # Demo CLI
 │   ├── pebble-bigtable/main.go       # Bigtable gRPC server
+│   ├── test-bigtable-client/main.go   # Official Bigtable client integration tests
 │   ├── test-recovery/main.go         # Crash recovery integration test
 │   ├── test-incremental/main.go      # Incremental upload test
 │   ├── test-eventual/main.go         # Eventual consistency test
@@ -440,6 +442,7 @@ cloudpebble/
 │   │   ├── readrows.go               # ReadRows: CellChunk streaming
 │   │   ├── filter.go                 # RowFilter evaluation engine
 │   │   ├── samplekeys.go             # SampleRowKeys
+│   │   ├── readmodifywrite.go         # ReadModifyWriteRow
 │   │   ├── types.go                  # RowProcessor callback type
 │   │   └── bigtablepb/               # Generated proto Go code
 │   ├── objstore/
@@ -459,10 +462,14 @@ cloudpebble/
 ## Testing
 
 ```bash
-# Run all unit tests (32 tests, no credentials needed)
+# Run all unit tests (no credentials needed)
 go test ./pkg/...
 
-# Run integration tests (require local filesystem only)
+# Run Bigtable client integration test (33 tests using official client)
+go run ./cmd/test-bigtable-client/
+go run ./cmd/test-bigtable-client/ --fuzz 500
+
+# Run storage integration tests (require local filesystem only)
 go run ./cmd/test-recovery/ step1 && go run ./cmd/test-recovery/ step2
 go run ./cmd/test-incremental/
 go run ./cmd/test-eventual/ step1 && go run ./cmd/test-eventual/ step2
