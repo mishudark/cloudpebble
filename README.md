@@ -4,6 +4,19 @@ CloudPebble adds durable object storage persistence to [Pebble](https://github.c
 
 A local Pebble instance serves as a read-optimized NVMe/SSD cache. All writes are durably committed to object storage (GCS) via a write-ahead log. Data is asynchronously indexed into SSTs and uploaded for cold reads and crash recovery.
 
+## Why CloudPebble
+
+- **Sub-millisecond cached reads.** Reads hit a local Pebble LSM tree  no network roundtrip.
+- **Immediate read-your-writes.** Writes are applied to the local memtable after GCS durability, so a single node sees its own writes instantly (strong consistency). 
+- **Embedded, not a service.** CloudPebble is a Go library, not a remote API. Deploy it alongside your application. No cold-start request routing, no load balancer, no per-query roundtrips — just a function call.
+- **Incremental checkpoints.** Only new or changed SST files are uploaded to object storage. Unchanged files are skipped, minimizing egress costs and sync time.
+- **WAL batching with configurable window.** Concurrent writes within the same window are coalesced into a single GCS object, amortizing the ~100ms GCS roundtrip across many writers. At 200ms batch window and 50k concurrent goroutines, extrapolated throughput exceeds 680k ops/sec.
+- **Bigtable v2 API over object storage.** Includes a production-grade gRPC server implementing MutateRow, ReadRows, CheckAndMutateRow, ReadModifyWriteRow, SampleRowKeys, and 14 RowFilter types — mapping Bigtable's wide-column model onto Pebble.
+- **Multi-backend object storage.** A minimal `Store` interface (Put/Get/Delete/List/Attrs) with GCS and local filesystem backends. Adding S3 or Azure Blob requires implementing a single interface.
+- **OpenTelemetry-native metrics.** Counters and latency histograms registered as OTEL observable instruments — no Prometheus bridge needed.
+- **Namespace isolation.** Each tenant gets its own prefix in object storage with independent Pebble DB, checkpoints, and WAL sequences. No cross-tenant data mixing.
+- **Crash recovery with cold-miss self-healing.** Nodes restart from GCS checkpoints and replay uncommitted WALs. A cold-miss detector triggers background recovery if consecutive cache misses suggest stale or missing local data.
+
 ```
                         ╔═══════════ cloudpebble ═══════════════════╗
 ╔════════════╗          ║                                           ║
@@ -43,13 +56,13 @@ Every write creates an immutable WAL object in object storage. Once the WAL is d
               └──────────────────────┘
 ```
 
-When batching is enabled (`BatchWindow > 0`, default 1s), concurrent writes within the same window are coalesced into a single GCS WAL object, matching turbopuffer's 1 WAL entry per second per namespace model.
+When batching is enabled (`BatchWindow > 0`, default 200ms), concurrent writes within the same window are coalesced into a single GCS WAL object.
 
 ```
                             Time ──────────────────────────────▶
 
   Write A ──┐
-  Write B ──┤─── Batch window (1s) ───┐
+  Write B ──┤─── Batch window (200ms) ───┐
   Write C ──┘                         │
                                        ▼
                               ┌────────────────┐
@@ -374,7 +387,7 @@ e, _ := engine.Open(engine.Options{
 | `Store` | **required** | Object storage backend (`gcs.Store`, `local.Store`, ...) |
 | `Namespace` | `"default"` | Tenant/namespace prefix in object storage |
 | `SyncInterval` | `30s` | Background checkpoint upload interval |
-| `BatchWindow` | `1s` | WAL batching window (negative = disabled) |
+| `BatchWindow` | `200ms` | WAL batching window (negative = disabled) |
 | `ColdMissThreshold` | `3` | Consecutive misses before triggering recovery |
 | `Consistency` | `Strong` | `Strong` or `Eventual` |
 | `OrphanWALTTL` | `1h` | Delete orphan WAL objects older than this |
