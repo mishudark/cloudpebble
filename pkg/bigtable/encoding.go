@@ -8,13 +8,15 @@ import (
 
 // Key encoding format:
 //
-//	[row_len:2][row_key][0x00][family_len:1][family][0x00][qual_len:2][qualifier][0x00][inverted_ts:8]
+//	[escaped_row_key][0x00][0x00][family_len:1][family][0x00][qual_len:2][qualifier][0x00][inverted_ts:8]
 //
-// Components are length-prefixed and separated by 0x00 sentinel bytes.
+// The row key uses null-escape encoding (0x00 → 0x00 0xFF) and is terminated
+// by 0x00 0x00. This preserves lexicographic ordering of raw row keys so that
+// forward/reverse scans and prefix ranges work correctly.
+//
+// Family and qualifier are length-prefixed and separated by 0x00 sentinel bytes.
 // The inverted timestamp (MaxInt64 - timestamp) ensures newest cells sort
 // first within a column under Pebble's ascending-by-default comparer.
-//
-// Overhead per cell: 2 + 1 + 1 + 2 + 1 + 8 = 15 bytes.
 
 // invertedTimestamp converts a Bigtable timestamp (microseconds) to the
 // inverted form used in Pebble keys. Inverted timestamps sort newest first
@@ -40,17 +42,30 @@ func timestampFromInverted(inv uint64) int64 {
 
 // encodeRowPrefix returns the key prefix that identifies a row:
 //
-//	[row_len:2][row_key][0x00]
+//	[escaped_row_key][0x00][0x00]
+//
+// Null bytes (0x00) in the row key are escaped as 0x00 0xFF.
+// The terminator 0x00 0x00 is guaranteed not to appear inside the escaped key.
 func encodeRowPrefix(rowKey []byte) []byte {
-	if len(rowKey) > math.MaxUint16 {
-		return nil
-	}
-	buf := make([]byte, 2+len(rowKey)+1)
-	// G115: bounds-checked above to guarantee len(rowKey) ≤ MaxUint16.
-	binary.BigEndian.PutUint16(buf, uint16(len(rowKey))) //nolint:gosec
-	copy(buf[2:], rowKey)
-	buf[2+len(rowKey)] = 0x00
+	escaped := escapeNullBytes(rowKey)
+	buf := make([]byte, len(escaped)+2)
+	copy(buf, escaped)
+	buf[len(escaped)] = 0x00
+	buf[len(escaped)+1] = 0x00
 	return buf
+}
+
+// escapeNullBytes returns the input with each 0x00 byte replaced by 0x00 0xFF.
+func escapeNullBytes(b []byte) []byte {
+	var out []byte
+	for _, c := range b {
+		if c == 0x00 {
+			out = append(out, 0x00, 0xFF)
+		} else {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // encodeFamilyPrefix returns the key prefix that identifies a column family
@@ -102,36 +117,50 @@ func EncodeCellKey(rowKey []byte, family string, qualifier []byte, timestampMicr
 // DecodeCellKey decodes a Pebble key back into its Bigtable components.
 // Returns false if the key format is invalid.
 func DecodeCellKey(key []byte) (rowKey []byte, family string, qualifier []byte, timestampMicros int64, ok bool) {
-	// Parse row key length.
-	if len(key) < 3 {
+	// Decode escaped row key. Scan for null-byte pairs:
+	//   0x00 0xFF → escaped null (part of row key)
+	//   0x00 0x00 → row terminator
+	var rowBytes []byte
+	pos := 0
+	for {
+		if pos >= len(key) {
+			return nil, "", nil, 0, false
+		}
+		if key[pos] != 0x00 {
+			rowBytes = append(rowBytes, key[pos])
+			pos++
+			continue
+		}
+		// key[pos] == 0x00
+		if pos+1 >= len(key) {
+			return nil, "", nil, 0, false
+		}
+		if key[pos+1] == 0xFF {
+			rowBytes = append(rowBytes, 0x00)
+			pos += 2
+			continue
+		}
+		if key[pos+1] == 0x00 {
+			pos += 2 // past terminator
+			break
+		}
 		return nil, "", nil, 0, false
 	}
-	rowLen := int(binary.BigEndian.Uint16(key))
-	if 2+rowLen+1 > len(key) {
-		return nil, "", nil, 0, false
-	}
-	if key[2+rowLen] != 0x00 {
-		return nil, "", nil, 0, false
-	}
-	rowKey = make([]byte, rowLen)
-	copy(rowKey, key[2:2+rowLen])
+	rowKey = rowBytes
 
 	// Parse family name.
-	pos := 2 + rowLen + 1 // after row prefix + sentinel
-	if pos+1 > len(key) || key[pos] == 0x00 {
+	if pos >= len(key) || key[pos] == 0x00 {
 		return nil, "", nil, 0, false
 	}
 	famLen := int(key[pos])
 	pos++
-	if pos+famLen+1 > len(key) {
+	if pos+famLen >= len(key) || key[pos+famLen] != 0x00 {
 		return nil, "", nil, 0, false
 	}
-	family = string(key[pos : pos+famLen])
-	pos += famLen
-	if key[pos] != 0x00 {
-		return nil, "", nil, 0, false
+	if famLen > 0 {
+		family = string(key[pos : pos+famLen])
 	}
-	pos++ // skip sentinel
+	pos += famLen + 1 // skip family + sentinel
 
 	// Parse qualifier.
 	if pos+2 > len(key) {
@@ -139,16 +168,12 @@ func DecodeCellKey(key []byte) (rowKey []byte, family string, qualifier []byte, 
 	}
 	qualLen := int(binary.BigEndian.Uint16(key[pos:]))
 	pos += 2
-	if pos+qualLen+1+8 > len(key) {
+	if pos+qualLen >= len(key) || key[pos+qualLen] != 0x00 {
 		return nil, "", nil, 0, false
 	}
 	qualifier = make([]byte, qualLen)
 	copy(qualifier, key[pos:pos+qualLen])
-	pos += qualLen
-	if key[pos] != 0x00 {
-		return nil, "", nil, 0, false
-	}
-	pos++ // skip sentinel
+	pos += qualLen + 1 // skip qualifier + sentinel
 
 	// Parse inverted timestamp.
 	if pos+8 != len(key) {
@@ -195,11 +220,13 @@ func columnEndKey(columnPrefix []byte) []byte {
 //
 //	MaxInt64-endTS < inv <= MaxInt64-startTS
 //
-// Which maps to Pebble bounds [col+inv(endTS)+1, col+inv(startTS)).
+// Which maps to Pebble bounds [col+inv(endTS)+1, col+inv(startTS)+1).
 // The +1 on endTS ensures the exclusive end of the Bigtable range maps to
 // the inclusive start of the Pebble range, so cells at exactly endTS are
-// excluded. This addition is safe because endTS is always > 0 when called
-// (the caller substitutes time.Now().UnixMicro() for zero).
+// excluded. The +1 on startTS ensures cells at exactly startTS are included
+// (Pebble DeleteRange's end is exclusive). This is safe because
+// inverted timestamps for non-negative timestamps are <= MaxInt64, so
+// adding 1 cannot overflow uint64.
 func encodeTimestampRangeBounds(columnPrefix []byte, startTimestampMicros, endTimestampMicros int64) (start, end []byte) {
 	startInv := invertedTimestamp(startTimestampMicros)
 	endInv := invertedTimestamp(endTimestampMicros)
@@ -213,7 +240,7 @@ func encodeTimestampRangeBounds(columnPrefix []byte, startTimestampMicros, endTi
 
 	endKey := make([]byte, len(columnPrefix)+8)
 	copy(endKey, columnPrefix)
-	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], startInv)
+	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], startInv+1)
 
 	return startKey, endKey
 }

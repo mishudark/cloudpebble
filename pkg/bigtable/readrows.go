@@ -85,6 +85,31 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 	var lastScannedRowKey []byte
 	rowCount := int64(0)
 
+	// commitLastChunk marks the last chunk in chunkBuf as commit_row.
+	commitLastChunk := func() {
+		if len(chunkBuf) == 0 {
+			return
+		}
+		chunkBuf[len(chunkBuf)-1].RowStatus = &bigtablepb.ReadRowsResponse_CellChunk_CommitRow{
+			CommitRow: true,
+		}
+	}
+
+	// Flush sends buffered chunks to the stream.
+	flush := func() error {
+		if len(chunkBuf) == 0 {
+			return nil
+		}
+		resp := &bigtablepb.ReadRowsResponse{
+			Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
+		}
+		if len(lastScannedRowKey) > 0 {
+			resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
+		}
+		chunkBuf = chunkBuf[:0]
+		return stream.Send(resp)
+	}
+
 	for _, kr := range scanRanges {
 		iter, err := db.NewIter(&pebble.IterOptions{
 			LowerBound: kr.Start,
@@ -107,7 +132,8 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 			// Check row boundary.
 			if !bytes.Equal(rk, lastRowKey) {
 				if rowStarted {
-					chunkBuf = append(chunkBuf, commitRowChunk())
+					// Close the previous row.
+					commitLastChunk()
 					lastScannedRowKey = append([]byte(nil), lastRowKey...)
 				}
 				rowCount++
@@ -118,31 +144,34 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 				rowStarted = true
 			}
 
+			val := iter.Value()
+			if len(val) > 0 {
+				val = append([]byte(nil), val...)
+			}
+
 			// Apply filter.
-			if filterEngine != nil && !filterEngine.matchesCell(rk, family, qualifier, ts, iter.Value()) {
+			if filterEngine != nil && !filterEngine.matchesCell(rk, family, qualifier, ts, val) {
 				continue
 			}
 
+			// Strip value if the filter chain includes a strip-value transformer.
+			if filterEngine != nil && filterEngine.hasStripValue() {
+				val = nil
+			}
+
 			// Emit cell chunk(s) — split large values across multiple chunks.
-			chunkBuf = appendCellChunks(chunkBuf, rk, family, qualifier, ts, iter.Value())
+			chunkBuf = appendCellChunks(chunkBuf, rk, family, qualifier, ts, val)
 
 			if len(chunkBuf) >= cellChunkBufferSize {
-				resp := &bigtablepb.ReadRowsResponse{
-					Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
-				}
-				if len(lastScannedRowKey) > 0 {
-					resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
-				}
-				if err := stream.Send(resp); err != nil {
+				if err := flush(); err != nil {
 					_ = iter.Close()
 					return err
 				}
-				chunkBuf = chunkBuf[:0]
 			}
 		}
 
 		if rowStarted {
-			chunkBuf = append(chunkBuf, commitRowChunk())
+			commitLastChunk()
 			lastScannedRowKey = append([]byte(nil), lastRowKey...)
 		}
 		_ = iter.Close()
@@ -152,17 +181,7 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 		}
 	}
 
-	// Flush remaining chunks.
-	if len(chunkBuf) > 0 {
-		resp := &bigtablepb.ReadRowsResponse{
-			Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
-		}
-		if len(lastScannedRowKey) > 0 {
-			resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
-		}
-		return stream.Send(resp)
-	}
-	return nil
+	return flush()
 }
 
 // rowRangeToBounds converts a Bigtable RowRange to Pebble scan bounds.
@@ -193,6 +212,8 @@ func rowRangeToBounds(rr *bigtablepb.RowRange) (start, end []byte) {
 // appendCellChunks appends one or more CellChunks for a cell value.
 // Values larger than maxCellChunkValueSize are split across multiple chunks
 // with value_size hints (total size) on all but the last chunk.
+// Only the first chunk carries the full cell metadata (row_key, family,
+// qualifier, timestamp). Continuation chunks only carry value and value_size.
 func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byte, family string, qualifier []byte, timestampMicros int64, value []byte) []*bigtablepb.ReadRowsResponse_CellChunk {
 	if len(value) <= maxCellChunkValueSize {
 		return append(buf, cellChunk(rowKey, family, qualifier, timestampMicros, value, nil))
@@ -203,13 +224,19 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 		if end > totalSize {
 			end = totalSize
 		}
-		chunk := cellChunk(rowKey, family, qualifier, timestampMicros, value[offset:end], nil)
-		if offset+maxCellChunkValueSize < totalSize || end < totalSize {
-			// All but the last chunk carry the total value size hint.
+		var chunk *bigtablepb.ReadRowsResponse_CellChunk
+		if offset == 0 {
+			chunk = cellChunk(rowKey, family, qualifier, timestampMicros, value[offset:end], nil)
+		} else {
+			// Continuation chunks carry only value (and optional value_size).
+			chunk = &bigtablepb.ReadRowsResponse_CellChunk{
+				Value: value[offset:end],
+			}
+		}
+		if end < totalSize {
 			if totalSize > math.MaxInt32 {
 				chunk.ValueSize = math.MaxInt32
 			} else {
-				// G115: bounds-checked above to guarantee totalSize ≤ MaxInt32.
 				chunk.ValueSize = int32(totalSize) //nolint:gosec
 			}
 		}

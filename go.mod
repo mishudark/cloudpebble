@@ -3,6 +3,7 @@ module github.com/mishudark/cloudpebble
 go 1.26.0
 
 require (
+	cloud.google.com/go/bigtable v1.47.0
 	cloud.google.com/go/storage v1.62.1
 	github.com/cockroachdb/pebble v0.0.0-20260514124130-a8392fabe934
 	github.com/fsouza/fake-gcs-server v1.54.0
@@ -20,6 +21,7 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	cloud.google.com/go/iam v1.11.0 // indirect
+	cloud.google.com/go/longrunning v0.13.0 // indirect
 	cloud.google.com/go/monitoring v1.29.0 // indirect
 	cloud.google.com/go/pubsub/v2 v2.5.1 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect

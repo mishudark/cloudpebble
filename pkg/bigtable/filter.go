@@ -623,6 +623,42 @@ func (e *rowFilterEngine) matchesCell(rowKey []byte, family string, qualifier []
 	})
 }
 
+// hasStripValue reports whether the filter engine (or chain/interleave
+// sub-filters) contains a strip-value transformer.
+func (e *rowFilterEngine) hasStripValue() bool {
+	return evaluatorHasStripValue(e.eval)
+}
+
+func evaluatorHasStripValue(e filterEvaluator) bool {
+	switch f := e.(type) {
+	case *stripValueFilter:
+		return true
+	case *chainFilter:
+		for _, sub := range f.filters {
+			if evaluatorHasStripValue(sub) {
+				return true
+			}
+		}
+	case *interleaveFilter:
+		for _, sub := range f.filters {
+			if evaluatorHasStripValue(sub) {
+				return true
+			}
+		}
+	case *conditionFilter:
+		if f.predicate != nil && evaluatorHasStripValue(f.predicate) {
+			return true
+		}
+		if f.trueFilter != nil && evaluatorHasStripValue(f.trueFilter) {
+			return true
+		}
+		if f.falseFilter != nil && evaluatorHasStripValue(f.falseFilter) {
+			return true
+		}
+	}
+	return false
+}
+
 // process iterates over the iterator, calling rp.OnCell for each cell that passes
 // the filter. Returns false if processing was stopped early.
 func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {

@@ -1195,11 +1195,11 @@ func TestValueRegexFilterViaReadRows(t *testing.T) {
 	// Should find v1 and v2 (match ^v[12]$), no v3/v4/v5.
 	valueCount := 0
 	for _, c := range allChunks {
-		if c.GetCommitRow() {
+		v := string(c.Value)
+		if v == "" {
 			continue
 		}
 		valueCount++
-		v := string(c.Value)
 		if v != "v1" && v != "v2" {
 			t.Fatalf("unexpected value %q", v)
 		}
