@@ -267,6 +267,53 @@ func TestNoBatching(t *testing.T) {
 	}
 }
 
+// TestBatching_CopiesData verifies that WriteRecord copies the data slice
+// instead of retaining a reference. The bug: batch.Repr() returns a slice
+// referencing Pebble's internal batch buffer; when the batch is closed and
+// the buffer is reused, the pending WAL data becomes corrupted.
+func TestBatching_CopiesData(t *testing.T) {
+	mgr := newTestManager(t, "ns", 100*time.Millisecond)
+	ctx := context.Background()
+
+	original := []byte("hello-world-batch-repr-data")
+	_, done, err := mgr.WriteRecord(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Modify the original slice. If WriteRecord didn't copy, the pending
+	// data is now corrupted.
+	for i := range original {
+		original[i] = 'X'
+	}
+
+	// Flush to commit the pending batch to the store.
+	err = mgr.Flush(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read back and verify it's the original data.
+	read, err := mgr.ReadRecord(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "hello-world-batch-repr-data"
+	if string(read) != want {
+		t.Fatalf("ReadRecord after Flush = %q, want %q (WriteRecord did not copy data)", read, want)
+	}
+
+	// Also verify via the done channel (timer path).
+	select {
+	case gcsErr := <-done:
+		if gcsErr != nil {
+			t.Fatalf("commit error: %v", gcsErr)
+		}
+	default:
+		// Timer may have already fired before Flush; that's fine.
+	}
+}
+
 func TestNextSeq(t *testing.T) {
 	mgr := newTestManager(t, "ns", 0)
 	if mgr.NextSeq() != 1 {

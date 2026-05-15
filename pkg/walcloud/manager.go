@@ -58,6 +58,7 @@ type Manager struct {
 	waiters     []chan error // callers waiting for this batch to commit
 	commitTimer *time.Timer
 	closed      atomic.Bool
+	wg          sync.WaitGroup // tracks in-flight batch flush goroutines
 }
 
 // NewManager creates a new WAL manager for the given namespace.
@@ -92,7 +93,9 @@ func (m *Manager) SetContext(ctx context.Context) {
 	m.ctx = ctx
 }
 
-// Close stops the timer and prevents further writes.
+// Close stops the timer, prevents further writes, and waits for any
+// in-flight batch flush to complete so that callers can safely close
+// the underlying store afterwards.
 func (m *Manager) Close() {
 	m.closed.Store(true)
 	m.mu.Lock()
@@ -101,6 +104,45 @@ func (m *Manager) Close() {
 		m.commitTimer = nil
 	}
 	m.mu.Unlock()
+	m.wg.Wait()
+}
+
+// Flush force-flushes the current batch window (if any), blocks until the
+// GCS write completes or ctx expires, and then waits for any previously
+// launched flush goroutines to finish. After Flush returns, all WAL data
+// written before the call is durable in object storage.
+func (m *Manager) Flush(ctx context.Context) error {
+	m.mu.Lock()
+	if m.commitTimer != nil {
+		m.commitTimer.Stop()
+		m.commitTimer = nil
+	}
+	segments := m.pending
+	seq := m.pendingSeq
+	waiters := m.waiters
+	m.pending = nil
+	m.pendingSeq = 0
+	m.waiters = nil
+	m.mu.Unlock()
+
+	if len(segments) == 0 {
+		m.wg.Wait()
+		return nil
+	}
+
+	data := mergeBatchSegments(segments)
+	p := m.walPath(seq)
+
+	m.wg.Add(1)
+	err := m.store.Put(ctx, p, data)
+	m.wg.Done()
+
+	for _, ch := range waiters {
+		ch <- err
+	}
+
+	m.wg.Wait()
+	return err
 }
 
 // walPath returns the full object store path for a WAL with the given seq.
@@ -147,7 +189,9 @@ func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, don
 		m.pending = make([][]byte, 0, 16)
 		m.commitTimer = time.AfterFunc(m.batchWindow, m.flushPending)
 	}
-	m.pending = append(m.pending, data)
+	buf := make([]byte, len(data))
+	copy(buf, data)
+	m.pending = append(m.pending, buf)
 	ch := make(chan error, 1)
 	m.waiters = append(m.waiters, ch)
 	seq = m.pendingSeq
@@ -177,7 +221,9 @@ func (m *Manager) flushPending() {
 	data := mergeBatchSegments(segments)
 	p := m.walPath(seq)
 
+	m.wg.Add(1)
 	go func() {
+		defer m.wg.Done()
 		var gcsErr error
 		ctx := m.ctx
 		if ctx == nil {

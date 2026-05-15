@@ -219,8 +219,11 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 func cellChunk(rowKey []byte, family string, qualifier []byte, timestampMicros int64, value []byte, labels []string) *bigtablepb.ReadRowsResponse_CellChunk {
 	chunk := &bigtablepb.ReadRowsResponse_CellChunk{
 		TimestampMicros: timestampMicros,
-		Value:           value,
 		Labels:          labels,
+	}
+	if len(value) > 0 {
+		chunk.Value = make([]byte, len(value))
+		copy(chunk.Value, value)
 	}
 	if len(rowKey) > 0 {
 		chunk.RowKey = make([]byte, len(rowKey))

@@ -318,6 +318,90 @@ func TestMultipleKeys(t *testing.T) {
 	}
 }
 
+// TestConcurrentCrashRecovery exercises the crash-recovery path with
+// concurrent writes and batching enabled. This specifically tests for
+// the bug where batch.Repr() returns a slice referencing Pebble's
+// internal batch buffer — when the batch is closed and reused from the
+// pool under concurrent load, the pending WAL data can become corrupted
+// if WriteRecord does not copy the slice.
+func TestConcurrentCrashRecovery(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pebble")
+	objDir := filepath.Join(t.TempDir(), "objstore")
+	ns := "ns-concurrent-crash"
+
+	e1 := newTestEngineNoCleanup(t, ns, dir, objDir)
+
+	const workers = 50
+	const keysPerWorker = 50
+	ctx := context.Background()
+
+	errCh := make(chan error, workers*keysPerWorker)
+	for w := 0; w < workers; w++ {
+		w := w
+		go func() {
+			for k := 0; k < keysPerWorker; k++ {
+				key := []byte{byte(w), byte(k >> 8), byte(k)}
+				val := []byte{byte(w), byte(k >> 8), byte(k), 0xff}
+				if err := e1.Set(ctx, key, val); err != nil {
+					errCh <- err
+					return
+				}
+			}
+			errCh <- nil
+		}()
+	}
+
+	for i := 0; i < workers; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requireNoErr(t, e1.Sync(ctx))
+
+	// Write some keys post-sync (WAL-only).
+	for i := 0; i < 10; i++ {
+		k := []byte{0xff, byte(i)}
+		v := []byte{0xfe, byte(i)}
+		requireNoErr(t, e1.Set(ctx, k, v))
+	}
+
+	simulateCrash(t, e1, dir)
+
+	e2 := newTestEngineNoCleanup(t, ns, dir, objDir,
+		func(o *engine.Options) { o.Consistency = engine.ConsistencyStrong },
+	)
+	defer func() { _ = e2.Close() }()
+
+	// Verify all pre-sync keys.
+	for w := 0; w < workers; w++ {
+		for k := 0; k < keysPerWorker; k++ {
+			key := []byte{byte(w), byte(k >> 8), byte(k)}
+			want := []byte{byte(w), byte(k >> 8), byte(k), 0xff}
+			got, err := e2.Get(key)
+			if err != nil {
+				t.Fatalf("pre-sync key [%d,%d]: %v", w, k, err)
+			}
+			if string(got) != string(want) {
+				t.Fatalf("pre-sync key [%d,%d]: got %x, want %x", w, k, got, want)
+			}
+		}
+	}
+
+	// Verify all post-sync (WAL-only) keys.
+	for i := 0; i < 10; i++ {
+		k := []byte{0xff, byte(i)}
+		want := []byte{0xfe, byte(i)}
+		got, err := e2.Get(k)
+		if err != nil {
+			t.Fatalf("post-sync key [%d]: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("post-sync key [%d]: got %x, want %x", i, got, want)
+		}
+	}
+}
+
 func TestOverwriteKey(t *testing.T) {
 	e := newTestEngine(t, "ns-overwrite")
 	ctx := context.Background()
