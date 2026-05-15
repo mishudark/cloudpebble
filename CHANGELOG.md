@@ -17,10 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Graceful shutdown with WaitGroup
 - Streaming store interface (`PutReader`, `GetReader`)
 - Health and readiness checks (`Engine.Health()`, `Engine.Ready()`)
-- Prometheus metrics export (`Metrics.RegisterPrometheus()`)
+- OpenTelemetry metrics export (`Metrics.RegisterOpenTelemetry()`)
 - Context propagation to `Open(ctx, opts)`
 
 ### Changed
+- Replaced Prometheus metrics with OpenTelemetry observable counters
 - Pebble dependency uses pseudo-version with documented replace directive
 - README updated to use non-deprecated gRPC insecure credentials
 - Manifest writes are now atomic (versioned manifest written first)
