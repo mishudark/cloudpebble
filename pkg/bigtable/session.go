@@ -2,7 +2,7 @@ package bigtable
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"io"
 
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
@@ -49,7 +49,7 @@ func (s *Server) handleSession(stream grpc.BidiStreamingServer[bigtablepb.Sessio
 		}
 
 		if err := s.dispatchVRPC(stream, tableName, vrpc); err != nil {
-			stream.Send(&bigtablepb.SessionResponse{
+			_ = stream.Send(&bigtablepb.SessionResponse{
 				Payload: &bigtablepb.SessionResponse_Error{
 					Error: &bigtablepb.ErrorResponse{RpcId: vrpc.GetRpcId()},
 				},
@@ -62,10 +62,10 @@ func (s *Server) handleSession(stream grpc.BidiStreamingServer[bigtablepb.Sessio
 func (s *Server) dispatchVRPC(stream grpc.BidiStreamingServer[bigtablepb.SessionRequest, bigtablepb.SessionResponse], tableName string, vrpc *bigtablepb.VirtualRpcRequest) error {
 	payload := vrpc.GetPayload()
 	if len(payload) == 0 {
-		return fmt.Errorf("empty vRPC payload")
+		return errors.New("empty vRPC payload")
 	}
 	if tableName == "" {
-		return fmt.Errorf("no table session established")
+		return errors.New("no table session established")
 	}
 
 	rpcID := vrpc.GetRpcId()
@@ -120,7 +120,7 @@ func (s *Server) dispatchVRPC(stream grpc.BidiStreamingServer[bigtablepb.Session
 		return stream.Send(sr)
 	}
 
-	return fmt.Errorf("unsupported vRPC request type")
+	return errors.New("unsupported vRPC request type")
 }
 
 // --- stream wrappers for session-based RPCs ---

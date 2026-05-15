@@ -30,7 +30,7 @@ func (s *fakeStore) fullPath(path string) string {
 func (s *fakeStore) Put(ctx context.Context, path string, data []byte) error {
 	w := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewWriter(ctx)
 	if _, err := w.Write(data); err != nil {
-		w.Close()
+		_ = w.Close()
 		return err
 	}
 	return w.Close()
@@ -41,7 +41,7 @@ func (s *fakeStore) Get(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	return io.ReadAll(r)
 }
 
@@ -94,9 +94,9 @@ func (s *fakeStore) Attrs(ctx context.Context, path string) (objstore.ObjectInfo
 
 func (s *fakeStore) PutReader(ctx context.Context, path string, r io.Reader, size int64) error {
 	w := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewWriter(ctx)
-	w.ObjectAttrs.Size = size
-	if _, err := io.Copy(w, r); err != nil {
-		w.Close()
+	w.Size = size
+	if 	_, err := io.Copy(w, r); err != nil {
+		_ = w.Close()
 		return err
 	}
 	return w.Close()
@@ -117,7 +117,7 @@ func newTestStore(t testing.TB) objstore.Store {
 	}
 	t.Cleanup(server.Stop)
 
-	server.CreateBucket("test-bucket")
+	server.CreateBucket("test-bucket") //nolint:staticcheck
 
 	return &fakeStore{
 		client: server.Client(),
@@ -153,7 +153,7 @@ func TestGCSStreaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetReader: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	buf := make([]byte, len(content))
 	n, err := io.ReadFull(rc, buf)
@@ -182,12 +182,11 @@ func TestGCSStreamingLarge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetReader large: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	got := make([]byte, len(payload))
-	n, err := io.ReadFull(rc, got)
-	if n != len(payload) {
-		t.Fatalf("Read large: got %d bytes, want %d", n, len(payload))
+	if _, err := io.ReadFull(rc, got); err != nil {
+		t.Fatal(err)
 	}
 	for i := range payload {
 		if got[i] != payload[i] {
@@ -219,18 +218,18 @@ func TestGCSNamespaceIsolation(t *testing.T) {
 	}
 	defer server.Stop()
 
-	server.CreateBucket("test-bucket")
+	server.CreateBucket("test-bucket") //nolint:staticcheck
 
 	client := server.Client()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	storeA := &fakeStore{client: client, bucket: "test-bucket", prefix: "ns-a/"}
 	storeB := &fakeStore{client: client, bucket: "test-bucket", prefix: "ns-b/"}
 
 	ctx := context.Background()
 
-	storeA.Put(ctx, "key", []byte("from-a"))
-	storeB.Put(ctx, "key", []byte("from-b"))
+	_ = storeA.Put(ctx, "key", []byte("from-a"))
+	_ = storeB.Put(ctx, "key", []byte("from-b"))
 
 	gotA, _ := storeA.Get(ctx, "key")
 	gotB, _ := storeB.Get(ctx, "key")

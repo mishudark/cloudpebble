@@ -23,7 +23,7 @@ type Store struct {
 // New creates a new local FS-backed Store rooted at the given directory.
 // The directory is created if it does not exist.
 func New(root string) (*Store, error) {
-	if err := os.MkdirAll(root, 0755); err != nil {
+	if err := os.MkdirAll(root, 0750); err != nil {
 		return nil, fmt.Errorf("local: creating root %s: %w", root, err)
 	}
 	return &Store{root: root}, nil
@@ -35,10 +35,10 @@ func (s *Store) path(p string) string {
 
 func (s *Store) Put(ctx context.Context, path string, data []byte) error {
 	full := s.path(path)
-	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(full), 0750); err != nil {
 		return fmt.Errorf("local: mkdir for %s: %w", path, err)
 	}
-	if err := os.WriteFile(full, data, 0644); err != nil {
+	if err := os.WriteFile(full, data, 0600); err != nil {
 		return fmt.Errorf("local: writing %s: %w", path, err)
 	}
 	return nil
@@ -120,15 +120,15 @@ func (s *Store) Attrs(ctx context.Context, path string) (objstore.ObjectInfo, er
 func (s *Store) Close() error { return nil }
 
 func (s *Store) PutReader(ctx context.Context, path string, r io.Reader, size int64) error {
-	full := s.path(path)
-	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+	full := filepath.Clean(s.path(path))
+	if err := os.MkdirAll(filepath.Dir(full), 0750); err != nil {
 		return fmt.Errorf("local: mkdir for %s: %w", path, err)
 	}
 	f, err := os.Create(full)
 	if err != nil {
 		return fmt.Errorf("local: creating %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := io.Copy(f, r); err != nil {
 		return fmt.Errorf("local: writing %s: %w", path, err)
 	}

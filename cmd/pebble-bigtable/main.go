@@ -21,10 +21,10 @@ func main() {
 	objectDir := flag.String("object-dir", "/tmp/cloudpebble-bigtable-obj", "object storage directory")
 	flag.Parse()
 
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+	if err := os.MkdirAll(*dataDir, 0750); err != nil {
 		log.Fatalf("creating data dir: %v", err)
 	}
-	if err := os.MkdirAll(*objectDir, 0755); err != nil {
+	if err := os.MkdirAll(*objectDir, 0750); err != nil {
 		log.Fatalf("creating object dir: %v", err)
 	}
 
@@ -49,7 +49,7 @@ func main() {
 		<-sigCh
 		fmt.Println("\nShutting down...")
 		grpcServer.GracefulStop()
-		srv.Close()
+		_ = srv.Close()
 		os.Exit(0)
 	}()
 

@@ -1,3 +1,4 @@
+// Package bigtable implements a Google Cloud Bigtable v2-compatible gRPC server.
 package bigtable
 
 import (
@@ -15,29 +16,38 @@ import (
 //
 // Overhead per cell: 2 + 1 + 1 + 2 + 1 + 8 = 15 bytes.
 
-const (
-	maxFamilyLen = 64
-)
-
 // invertedTimestamp converts a Bigtable timestamp (microseconds) to the
 // inverted form used in Pebble keys. Inverted timestamps sort newest first
 // since larger timestamps produce smaller inverted values.
+//
+// The subtraction MaxInt64 - timestampMicros may overflow int64 when the
+// timestamp is negative; this is intentional. The overflow maps negative
+// timestamps to values > MaxInt64 in the uint64 space, preserving the
+// total ordering required by Bigtable's key encoding.
 func invertedTimestamp(timestampMicros int64) uint64 {
-	return uint64(math.MaxInt64 - timestampMicros)
+	return uint64(math.MaxInt64 - timestampMicros) //nolint:gosec
 }
 
 // timestampFromInverted converts a Pebble inverted timestamp back to a
 // Bigtable timestamp.
+//
+// The int64(inv) conversion may overflow when inv > MaxInt64 (negative
+// timestamps). This is the inverse of invertedTimestamp and is required
+// for correct round-trip encoding.
 func timestampFromInverted(inv uint64) int64 {
-	return math.MaxInt64 - int64(inv)
+	return math.MaxInt64 - int64(inv) //nolint:gosec
 }
 
 // encodeRowPrefix returns the key prefix that identifies a row:
 //
 //	[row_len:2][row_key][0x00]
 func encodeRowPrefix(rowKey []byte) []byte {
+	if len(rowKey) > math.MaxUint16 {
+		return nil
+	}
 	buf := make([]byte, 2+len(rowKey)+1)
-	binary.BigEndian.PutUint16(buf, uint16(len(rowKey)))
+	// G115: bounds-checked above to guarantee len(rowKey) ≤ MaxUint16.
+	binary.BigEndian.PutUint16(buf, uint16(len(rowKey))) //nolint:gosec
 	copy(buf[2:], rowKey)
 	buf[2+len(rowKey)] = 0x00
 	return buf
@@ -48,9 +58,13 @@ func encodeRowPrefix(rowKey []byte) []byte {
 //
 //	[row_prefix][family_len:1][family][0x00]
 func encodeFamilyPrefix(rowPrefix []byte, family string) []byte {
+	if len(family) > math.MaxUint8 {
+		return nil
+	}
 	buf := make([]byte, len(rowPrefix)+1+len(family)+1)
 	copy(buf, rowPrefix)
-	buf[len(rowPrefix)] = byte(len(family))
+	// G115: bounds-checked above to guarantee len(family) ≤ MaxUint8.
+	buf[len(rowPrefix)] = byte(len(family)) //nolint:gosec
 	copy(buf[len(rowPrefix)+1:], family)
 	buf[len(rowPrefix)+1+len(family)] = 0x00
 	return buf
@@ -61,9 +75,13 @@ func encodeFamilyPrefix(rowPrefix []byte, family string) []byte {
 //
 //	[family_prefix][qual_len:2][qualifier][0x00]
 func encodeColumnPrefix(familyPrefix []byte, qualifier []byte) []byte {
+	if len(qualifier) > math.MaxUint16 {
+		return nil
+	}
 	buf := make([]byte, len(familyPrefix)+2+len(qualifier)+1)
 	copy(buf, familyPrefix)
-	binary.BigEndian.PutUint16(buf[len(familyPrefix):], uint16(len(qualifier)))
+	// G115: bounds-checked above to guarantee len(qualifier) ≤ MaxUint16.
+	binary.BigEndian.PutUint16(buf[len(familyPrefix):], uint16(len(qualifier))) //nolint:gosec
 	copy(buf[len(familyPrefix)+2:], qualifier)
 	buf[len(familyPrefix)+2+len(qualifier)] = 0x00
 	return buf

@@ -30,7 +30,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -39,7 +39,7 @@ func main() {
 	value := []byte("world")
 
 	fmt.Printf("Setting %q = %q\n", key, value)
-	if err := e.Set(ctx, key, value); err != nil {
+	if err = e.Set(ctx, key, value); err != nil {
 		log.Fatal(err)
 	}
 

@@ -39,7 +39,7 @@ func populateTable(t *testing.T, s *Server, table string) {
 
 func TestReadRowsSingleKey(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -87,7 +87,7 @@ func TestReadRowsSingleKey(t *testing.T) {
 
 func TestReadRowsMultipleKeys(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -122,7 +122,7 @@ func TestReadRowsMultipleKeys(t *testing.T) {
 
 func TestReadRowsRowRange(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -172,7 +172,7 @@ func TestReadRowsRowRange(t *testing.T) {
 
 func TestReadRowsFullScan(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -205,7 +205,7 @@ func TestReadRowsFullScan(t *testing.T) {
 
 func TestReadRowsWithFilter(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -249,7 +249,7 @@ func TestReadRowsWithFilter(t *testing.T) {
 
 func TestReadRowsBlockAllFilter(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -280,7 +280,7 @@ func TestReadRowsBlockAllFilter(t *testing.T) {
 
 func TestReadRowsRowsLimit(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -312,7 +312,7 @@ func TestReadRowsRowsLimit(t *testing.T) {
 
 func TestReadRowsEmptyTable(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadRowsRequest{
 		TableName: table,
@@ -331,7 +331,7 @@ func TestReadRowsEmptyTable(t *testing.T) {
 
 func TestReadRowsNonExistentKey(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -354,7 +354,7 @@ func TestReadRowsNonExistentKey(t *testing.T) {
 
 func TestReadRowsOpenStartRange(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -401,7 +401,7 @@ func TestReadRowsOpenStartRange(t *testing.T) {
 
 func TestReadRowsEndClosedRange(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -448,7 +448,7 @@ func TestReadRowsEndClosedRange(t *testing.T) {
 
 func TestReadRowsWithMultipleScenarios(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	// Write many cells across rows to trigger chunk buffering.
 	eng := openTableEngine(t, s, table)
@@ -551,7 +551,7 @@ func TestAppendCellChunksLargeValue(t *testing.T) {
 		t.Fatalf("expected 2 chunks for %d-byte value, got %d", len(largeVal), len(buf))
 	}
 	// First chunk should have value_size hint set to total length.
-	if buf[0].ValueSize != int32(len(largeVal)) {
+	if int(buf[0].ValueSize) != len(largeVal) {
 		t.Fatalf("expected value_size=%d on first chunk, got %d", len(largeVal), buf[0].ValueSize)
 	}
 	if len(buf[0].Value) != maxCellChunkValueSize {
@@ -644,7 +644,7 @@ func TestRowRangeToBounds(t *testing.T) {
 
 func TestReadRowsInvalidFilter(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadRowsRequest{
 		TableName: table,
@@ -667,7 +667,7 @@ func TestReadRowsInvalidFilter(t *testing.T) {
 
 func TestReadRowsReversed(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -714,7 +714,7 @@ func TestReadRowsReversed(t *testing.T) {
 
 func TestReadRowsReversedWithLimit(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{
@@ -751,7 +751,7 @@ func TestReadRowsReversedWithLimit(t *testing.T) {
 
 func TestReadRowsPartialResponseMultipleRanges(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	populateTable(t, s, table)
 
 	req := &bigtablepb.ReadRowsRequest{

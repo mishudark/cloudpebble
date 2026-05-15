@@ -87,7 +87,7 @@ func FuzzBatchWriteRead(f *testing.F) {
 
 		for _, ch := range []<-chan error{done1, done2, done3} {
 			select {
-			case err := <-ch:
+			case err = <-ch:
 				if err != nil {
 					t.Skipf("batch commit error: %v", err)
 				}
@@ -131,7 +131,7 @@ func FuzzMonotonicSequences(f *testing.F) {
 		ctx := context.Background()
 		var prev uint64
 		for i := uint8(0); i < count; i++ {
-			seq, _, err := mgr.WriteRecord(ctx, []byte{byte(start + i)})
+			seq, _, err := mgr.WriteRecord(ctx, []byte{byte(start + i)}) //nolint:unconvert
 			if err != nil {
 				t.Skip(err)
 			}
@@ -174,11 +174,11 @@ func FuzzGC(f *testing.F) {
 
 		ctx := context.Background()
 		for i := uint8(0); i < total; i++ {
-			_, _, err := mgr.WriteRecord(ctx, []byte{byte(i)})
-			if err != nil {
-				t.Skip(err)
-			}
+		_, _, err = mgr.WriteRecord(ctx, []byte{byte(i)}) //nolint:unconvert
+		if err != nil {
+			t.Skip(err)
 		}
+	}
 
 		deleted, err := mgr.GC(ctx, uint64(gcUpTo), 0)
 		if err != nil {
@@ -290,7 +290,7 @@ func FuzzRecovery(f *testing.F) {
 		}
 
 		for i := uint8(0); i < nWrites; i++ {
-			_, _, err := mgr1.WriteRecord(ctx, []byte{byte(i)})
+			_, _, err = mgr1.WriteRecord(ctx, []byte{byte(i)}) //nolint:unconvert
 			if err != nil {
 				t.Skip(err)
 			}
@@ -330,9 +330,6 @@ func FuzzBatchHeaderOps(f *testing.F) {
 		copy(data, header)
 
 		count := walcloud.BatchCount(data)
-		if count < 0 {
-			return
-		}
 
 		walcloud.SetBatchCount(data, count+1)
 		newCount := walcloud.BatchCount(data)
@@ -363,10 +360,7 @@ func FuzzMergeBatchSegments(f *testing.F) {
 		}
 
 		if len(seg1) >= 12 && len(seg2) >= 12 {
-			count := walcloud.BatchCount(result)
-			if count < 0 {
-				t.Fatalf("negative merged count: %d", count)
-			}
+			_ = walcloud.BatchCount(result)
 		}
 	})
 }

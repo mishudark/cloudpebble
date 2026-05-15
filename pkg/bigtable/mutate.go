@@ -2,6 +2,7 @@ package bigtable
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -30,7 +31,7 @@ func (s *Server) MutateRow(ctx context.Context, req *bigtablepb.MutateRowRequest
 
 	db := eng.DB()
 	batch := db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := applyMutationsToBatch(batch, rowKey, req.GetMutations()); err != nil {
 		return nil, err
@@ -57,7 +58,7 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 
 	db := eng.DB()
 	batch := db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	var entryErrors []struct {
 		index int64
@@ -65,7 +66,7 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 	}
 
 	for i, entry := range entries {
-		if err := applyMutationsToBatch(batch, entry.GetRowKey(), entry.GetMutations()); err != nil {
+		if err = applyMutationsToBatch(batch, entry.GetRowKey(), entry.GetMutations()); err != nil {
 			entryErrors = append(entryErrors, struct {
 				index int64
 				err   error
@@ -160,7 +161,7 @@ func (s *Server) CheckAndMutateRow(ctx context.Context, req *bigtablepb.CheckAnd
 	}
 
 	batch := db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := applyMutationsToBatch(batch, rowKey, mutations); err != nil {
 		return nil, err
@@ -184,7 +185,7 @@ func rowHasCells(db *pebble.DB, rowKey []byte, filter *bigtablepb.RowFilter) boo
 	if err != nil {
 		return false
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	if filter == nil {
 		return iter.First() && iter.Valid()
@@ -276,12 +277,23 @@ func applyDeleteFromRow(batch *pebble.Batch, rowKey []byte) error {
 func toBigtableStatus(err error) *rpcstatus.Status {
 	s, _ := status.FromError(err)
 	return &rpcstatus.Status{
-		Code:    int32(s.Code()),
+		Code:    statusCodeInt32(s.Code()),
 		Message: s.Message(),
 	}
 }
 
 // okStatus returns a rpcstatus.Status representing OK.
 func okStatus() *rpcstatus.Status {
-	return &rpcstatus.Status{Code: int32(codes.OK)}
+	return &rpcstatus.Status{Code: statusCodeInt32(codes.OK)}
+}
+
+// statusCodeInt32 converts a gRPC status code to int32.
+// gRPC status codes are defined as uint32 values below 20, so
+// conversion to int32 is always safe within the valid range.
+func statusCodeInt32(c codes.Code) int32 {
+	v := uint32(c)
+	if v > math.MaxInt32 {
+		return int32(codes.Internal)
+	}
+	return int32(v)
 }

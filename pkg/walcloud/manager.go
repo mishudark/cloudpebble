@@ -21,6 +21,7 @@ package walcloud
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"path"
 	"sort"
@@ -167,19 +168,16 @@ func (m *Manager) flushPending() {
 const batchHeaderLen = 12
 
 // batchCount reads the record count from a Pebble batch repr header.
-func batchCount(data []byte) int {
+func batchCount(data []byte) uint32 {
 	if len(data) < batchHeaderLen {
 		return 0
 	}
-	return int(data[8]) | int(data[9])<<8 | int(data[10])<<16 | int(data[11])<<24
+	return uint32(data[8]) | uint32(data[9])<<8 | uint32(data[10])<<16 | uint32(data[11])<<24
 }
 
 // setBatchCount writes the record count into a Pebble batch repr header.
-func setBatchCount(data []byte, n int) {
-	data[8] = byte(n)
-	data[9] = byte(n >> 8)
-	data[10] = byte(n >> 16)
-	data[11] = byte(n >> 24)
+func setBatchCount(data []byte, n uint32) {
+	binary.LittleEndian.PutUint32(data[8:12], n)
 }
 
 // mergeBatchSegments merges N Pebble batch repr segments into one valid

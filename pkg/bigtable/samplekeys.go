@@ -1,6 +1,8 @@
 package bigtable
 
 import (
+	"math"
+
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -38,7 +40,12 @@ func (s *Server) SampleRowKeys(req *bigtablepb.SampleRowKeysRequest, stream grpc
 					return err
 				}
 			}
-			offsetBytes += int64(sst.Size)
+		if sst.Size > math.MaxInt64 {
+				offsetBytes = math.MaxInt64
+				continue
+			}
+			// G115: bounds-checked above to guarantee sst.Size ≤ MaxInt64.
+			offsetBytes += int64(sst.Size) //nolint:gosec
 		}
 	}
 

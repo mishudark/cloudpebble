@@ -2,6 +2,7 @@ package bigtable
 
 import (
 	"bytes"
+	"math"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
@@ -131,7 +132,7 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 					resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
 				}
 				if err := stream.Send(resp); err != nil {
-					iter.Close()
+					_ = iter.Close()
 					return err
 				}
 				chunkBuf = chunkBuf[:0]
@@ -142,7 +143,7 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 			chunkBuf = append(chunkBuf, commitRowChunk())
 			lastScannedRowKey = append([]byte(nil), lastRowKey...)
 		}
-		iter.Close()
+		_ = iter.Close()
 
 		if rowsLimit > 0 && rowCount >= rowsLimit {
 			break
@@ -201,7 +202,12 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 		chunk := cellChunk(rowKey, family, qualifier, timestampMicros, value[offset:end], nil)
 		if offset+maxCellChunkValueSize < totalSize || end < totalSize {
 			// All but the last chunk carry the total value size hint.
-			chunk.ValueSize = int32(totalSize)
+			if totalSize > math.MaxInt32 {
+				chunk.ValueSize = math.MaxInt32
+			} else {
+				// G115: bounds-checked above to guarantee totalSize ≤ MaxInt32.
+				chunk.ValueSize = int32(totalSize) //nolint:gosec
+			}
 		}
 		buf = append(buf, chunk)
 	}

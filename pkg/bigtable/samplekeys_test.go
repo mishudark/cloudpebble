@@ -9,7 +9,7 @@ import (
 
 func TestSampleRowKeysEmptyTable(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.SampleRowKeysRequest{
 		TableName: table,
@@ -27,7 +27,7 @@ func TestSampleRowKeysEmptyTable(t *testing.T) {
 
 func TestSampleRowKeysWithData(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	// Write some data to create SST files.
 	eng := openTableEngine(t, s, table)
@@ -58,7 +58,7 @@ func TestSampleRowKeysWithData(t *testing.T) {
 
 func TestSampleRowKeysOrdered(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()

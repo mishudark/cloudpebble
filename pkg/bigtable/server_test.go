@@ -77,7 +77,7 @@ func TestPingAndWarm(t *testing.T) {
 	ctx := context.Background()
 
 	// Open the table first, then ping it.
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 	_, err := s.getEngine(ctx, table)
 	if err != nil {
 		t.Fatal(err)

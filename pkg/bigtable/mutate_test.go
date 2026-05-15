@@ -14,6 +14,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const testTable = "projects/p/instances/i/tables/t"
+
 // mockServerStream implements grpc.ServerStreamingServer for testing.
 // T must be a pointer type (e.g. *bigtablepb.MutateRowsResponse).
 type mockServerStream[T any] struct {
@@ -43,7 +45,7 @@ func (m *mockServerStream[T]) RecvMsg(any) error            { return io.EOF }
 func TestMutateRowSetCell(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	req := &bigtablepb.MutateRowRequest{
 		TableName: table,
@@ -74,7 +76,7 @@ func TestMutateRowSetCell(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("hello")) {
 		t.Fatalf("value mismatch: got %q, want %q", val, "hello")
 	}
@@ -83,7 +85,7 @@ func TestMutateRowSetCell(t *testing.T) {
 func TestMutateRowSetCellDefaultTimestamp(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	before := time.Now().UnixMicro()
 	req := &bigtablepb.MutateRowRequest{
@@ -116,7 +118,7 @@ func TestMutateRowSetCellDefaultTimestamp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	if !iter.First() {
 		t.Fatal("expected at least one cell")
 	}
@@ -132,7 +134,7 @@ func TestMutateRowSetCellDefaultTimestamp(t *testing.T) {
 func TestMutateRowDeleteFromColumn(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	// Write a cell first.
 	eng := openTableEngine(t, s, table)
@@ -166,7 +168,7 @@ func TestMutateRowDeleteFromColumn(t *testing.T) {
 	_, closer, err := db.Get(key)
 	if err != pebble.ErrNotFound {
 		if closer != nil {
-			closer.Close()
+			_ = closer.Close()
 		}
 		t.Fatal("expected cell to be deleted")
 	}
@@ -175,7 +177,7 @@ func TestMutateRowDeleteFromColumn(t *testing.T) {
 func TestMutateRowDeleteFromColumnWithTimeRange(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -217,7 +219,7 @@ func TestMutateRowDeleteFromColumnWithTimeRange(t *testing.T) {
 	_, closer, err := db.Get(key1)
 	if err != pebble.ErrNotFound {
 		if closer != nil {
-			closer.Close()
+			_ = closer.Close()
 		}
 		t.Fatal("expected ts=100 cell to be deleted")
 	}
@@ -227,7 +229,7 @@ func TestMutateRowDeleteFromColumnWithTimeRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected ts=300 cell to exist: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("v2")) {
 		t.Fatalf("value mismatch: got %q", val)
 	}
@@ -236,7 +238,7 @@ func TestMutateRowDeleteFromColumnWithTimeRange(t *testing.T) {
 func TestMutateRowDeleteFromFamily(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -274,7 +276,7 @@ func TestMutateRowDeleteFromFamily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected cf1 cell to exist: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("keep")) {
 		t.Fatalf("value mismatch: got %q", val)
 	}
@@ -283,7 +285,7 @@ func TestMutateRowDeleteFromFamily(t *testing.T) {
 	_, closer2, err := db.Get(key2)
 	if err != pebble.ErrNotFound {
 		if closer2 != nil {
-			closer2.Close()
+			_ = closer2.Close()
 		}
 		t.Fatal("expected cf2 cell to be deleted")
 	}
@@ -292,7 +294,7 @@ func TestMutateRowDeleteFromFamily(t *testing.T) {
 func TestMutateRowDeleteFromRow(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -327,7 +329,7 @@ func TestMutateRowDeleteFromRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 	if iter.First() {
 		t.Fatal("expected no cells in row1")
 	}
@@ -338,7 +340,7 @@ func TestMutateRowMissingRowKey(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.MutateRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 		Mutations: []*bigtablepb.Mutation{
 			{
 				Mutation: &bigtablepb.Mutation_SetCell_{
@@ -366,7 +368,7 @@ func TestMutateRowMissingMutations(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.MutateRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 		RowKey:    []byte("row1"),
 	}
 
@@ -384,7 +386,7 @@ func TestMutateRowUnimplementedAddToCell(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.MutateRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 		RowKey:    []byte("row1"),
 		Mutations: []*bigtablepb.Mutation{
 			{
@@ -409,7 +411,7 @@ func TestMutateRowUnimplementedMergeToCell(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.MutateRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 		RowKey:    []byte("row1"),
 		Mutations: []*bigtablepb.Mutation{
 			{
@@ -432,7 +434,7 @@ func TestMutateRowUnimplementedMergeToCell(t *testing.T) {
 func TestMutateRowMultipleMutations(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	req := &bigtablepb.MutateRowRequest{
 		TableName: table,
@@ -474,7 +476,7 @@ func TestMutateRowMultipleMutations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer1.Close()
+	defer func() { _ = closer1.Close() }()
 	if !bytes.Equal(val1, []byte("v1")) {
 		t.Fatalf("value mismatch: got %q", val1)
 	}
@@ -484,7 +486,7 @@ func TestMutateRowMultipleMutations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer2.Close()
+	defer func() { _ = closer2.Close() }()
 	if !bytes.Equal(val2, []byte("v2")) {
 		t.Fatalf("value mismatch: got %q", val2)
 	}
@@ -492,7 +494,7 @@ func TestMutateRowMultipleMutations(t *testing.T) {
 
 func TestMutateRowsSuccess(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	req := &bigtablepb.MutateRowsRequest{
 		TableName: table,
@@ -559,7 +561,7 @@ func TestMutateRowsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer1.Close()
+	defer func() { _ = closer1.Close() }()
 	if !bytes.Equal(val1, []byte("v1")) {
 		t.Fatalf("value mismatch: got %q", val1)
 	}
@@ -569,7 +571,7 @@ func TestMutateRowsEmptyEntries(t *testing.T) {
 	s := newTestServer(t)
 
 	req := &bigtablepb.MutateRowsRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 	}
 
 	stream := newMockServerStream[*bigtablepb.MutateRowsResponse]()
@@ -581,7 +583,7 @@ func TestMutateRowsEmptyEntries(t *testing.T) {
 
 func TestMutateRowsPartialFailure(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	req := &bigtablepb.MutateRowsRequest{
 		TableName: table,
@@ -645,7 +647,7 @@ func TestMutateRowsPartialFailure(t *testing.T) {
 func TestCheckAndMutateRowPredicateMatched(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	// Pre-write a cell so predicate matches.
 	eng := openTableEngine(t, s, table)
@@ -701,7 +703,7 @@ func TestCheckAndMutateRowPredicateMatched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("true-branch")) {
 		t.Fatalf("expected true-branch value, got %q", val)
 	}
@@ -710,7 +712,7 @@ func TestCheckAndMutateRowPredicateMatched(t *testing.T) {
 func TestCheckAndMutateRowPredicateNotMatched(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	// No cells in row1 = predicate won't match (row is empty).
 	req := &bigtablepb.CheckAndMutateRowRequest{
@@ -761,7 +763,7 @@ func TestCheckAndMutateRowPredicateNotMatched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("false-branch")) {
 		t.Fatalf("expected false-branch value, got %q", val)
 	}
@@ -770,7 +772,7 @@ func TestCheckAndMutateRowPredicateNotMatched(t *testing.T) {
 func TestCheckAndMutateRowNoMutations(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 
 	req := &bigtablepb.CheckAndMutateRowRequest{
 		TableName: table,
@@ -795,7 +797,7 @@ func TestCheckAndMutateRowMissingRowKey(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.CheckAndMutateRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: testTable,
 	}
 
 	_, err := s.CheckAndMutateRow(ctx, req)
@@ -809,7 +811,7 @@ func TestCheckAndMutateRowMissingRowKey(t *testing.T) {
 
 func TestRowHasCells(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
 
@@ -828,7 +830,7 @@ func TestRowHasCells(t *testing.T) {
 
 func TestRowHasCellsWithFilter(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
+	table := testTable
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
 

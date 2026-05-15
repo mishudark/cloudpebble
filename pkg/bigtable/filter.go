@@ -2,7 +2,8 @@ package bigtable
 
 import (
 	"bytes"
-	"math/rand"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"regexp"
 	"strings"
 
@@ -34,7 +35,6 @@ type cellInfo struct {
 	qualifier []byte
 	ts        int64
 	value     []byte
-	labels    []string
 }
 
 // filterEvaluator decides whether a cell passes the filter.
@@ -576,12 +576,20 @@ type rowSampleFilter struct {
 func (r *rowSampleFilter) evaluate(cell cellInfo) bool {
 	if !bytes.Equal(cell.rowKey, r.seenRow) {
 		r.seenRow = append(r.seenRow[:0], cell.rowKey...)
-		r.sampleRow = rand.Float64() < r.rate
+		r.sampleRow = cryptoRandFloat64() < r.rate
 	}
 	return r.sampleRow
 }
 func (r *rowSampleFilter) reset() {
 	r.seenRow = r.seenRow[:0]
+}
+
+func cryptoRandFloat64() float64 {
+	var buf [8]byte
+	_, _ = cryptorand.Read(buf[:])
+	// Use top 53 bits as the mantissa for a float64 in [0, 1).
+	v := binary.BigEndian.Uint64(buf[:]) >> 11
+	return float64(v) / (1 << 53)
 }
 
 // --- Filter engine methods ---

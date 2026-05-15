@@ -17,8 +17,8 @@ func main() {
 	objDir := filepath.Join(os.TempDir(), "cloudpebble-test-incr-obj")
 	namespace := "test-incr"
 
-	os.RemoveAll(dir)
-	os.RemoveAll(objDir)
+	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(objDir)
 
 	store, err := local.New(objDir)
 	if err != nil {
@@ -37,8 +37,8 @@ func main() {
 	}
 
 	// Write data and sync
-	e.Set(context.Background(), []byte("k1"), []byte("v1"))
-	e.Set(context.Background(), []byte("k2"), []byte("v2"))
+	_ = e.Set(context.Background(), []byte("k1"), []byte("v1"))
+	_ = e.Set(context.Background(), []byte("k2"), []byte("v2"))
 
 	if err := e.Sync(context.Background()); err != nil {
 		log.Fatal(err)
@@ -56,14 +56,14 @@ func main() {
 	fmt.Printf("Files after Sync 2 (no new data): %d\n", len(files2))
 
 	// Write new data and sync — should upload new files ONLY
-	e.Set(context.Background(), []byte("k3"), []byte("v3"))
+	_ = e.Set(context.Background(), []byte("k3"), []byte("v3"))
 	if err := e.Sync(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 	files3, _ := store.List(context.Background(), "test-incr/data/")
 	fmt.Printf("Files after Sync 3 (new data): %d\n", len(files3))
 
-	e.Close()
+	_ = e.Close()
 
 	if len(files1) == len(files2) {
 		fmt.Println("PASS: incremental upload — no redundant uploads on no-op sync")

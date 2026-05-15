@@ -1,7 +1,9 @@
+version: "2"
 run:
   timeout: 5m
 
 linters:
+  default: none
   enable:
     - errcheck
     - govet
@@ -12,36 +14,58 @@ linters:
     - gosec
     - misspell
     - unconvert
-    - wastedassign
-    - bodyclose
-    - noctx
-    - prealloc
-    - unparam
+    - fatcontext
+    - perfsprint
+    - usetesting
+    - recvcheck
 
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: false
-  gosec:
-    severity: medium
-    confidence: medium
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment
-  staticcheck:
-    checks: ["all"]
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+    gosec:
+      severity: medium
+      confidence: medium
+    govet:
+      enable:
+        - asmdecl
+        - assign
+        - atomic
+        - bools
+        - copylocks
+        - defers
+        - directive
+        - errorsas
+        - framepointer
+        - httpresponse
+        - ifaceassert
+        - loopclosure
+        - lostcancel
+        - nilfunc
+        - nilness
+        - printf
+        - reflectvaluecompare
+        - shadow
+        - shift
+        - sigchanyzer
+        - slog
+        - sortslice
+        - stdmethods
+        - stringintconv
+        - structtag
+        - testinggoroutine
+        - tests
+        - unmarshal
+        - unreachable
+        - unsafeptr
+        - unusedwrite
+        - unusedresult
+    staticcheck:
+      checks: ["all"]
 
 issues:
   exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-        - noctx
-    - path: bigtablepb/
-      linters:
-        - unused
-        - govet
-    - path: pkg/bigtable/bigtablepb/
-      text: ".*"
+    - path: "*_test.go"
+      linters: [errcheck, gosec]
+    - path: "*/bigtablepb/*"
+      linters: [unused, govet]

@@ -1,3 +1,6 @@
+// Package engine implements a key-value storage engine that provides durable
+// writes via an object-storage-backed write-ahead log (WAL) and local Pebble
+// LSM for fast reads.
 package engine
 
 import (
@@ -5,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -151,7 +155,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		opts.Dir = os.TempDir()
 	}
 	if opts.Store == nil {
-		return nil, fmt.Errorf("engine: objstore.Store is required")
+		return nil, errors.New("engine: objstore.Store is required")
 	}
 	if opts.Namespace == "" {
 		opts.Namespace = "default"
@@ -183,7 +187,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: creating WAL manager: %w", err)
 	}
 
-	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
+	if err := os.MkdirAll(opts.Dir, 0750); err != nil {
 		return nil, fmt.Errorf("engine: creating local dir: %w", err)
 	}
 
@@ -237,7 +241,7 @@ func (e *Engine) recover(ctx context.Context) error {
 
 	if hasManifest {
 		var m Manifest
-		if err := json.Unmarshal(manifestBytes, &m); err != nil {
+		if err = json.Unmarshal(manifestBytes, &m); err != nil {
 			var old struct{ MaxWALSeq uint64 }
 			if err2 := json.Unmarshal(manifestBytes, &old); err2 != nil {
 				return fmt.Errorf("decoding manifest: %w", err)
@@ -248,18 +252,20 @@ func (e *Engine) recover(ctx context.Context) error {
 		e.manifestVersion = m.Version
 
 		dataPrefix := e.dataPrefix()
-		files, err := e.store.List(ctx, dataPrefix)
+		var files []string
+		files, err = e.store.List(ctx, dataPrefix)
 		if err != nil {
 			return fmt.Errorf("listing data files: %w", err)
 		}
 		for _, f := range files {
 			localName := filepath.Base(f)
 			localPath := filepath.Join(e.localDir, localName)
-			data, err := e.store.Get(ctx, f)
-			if err != nil {
-				return fmt.Errorf("downloading %s: %w", f, err)
-			}
-			if err := os.WriteFile(localPath, data, 0644); err != nil {
+		var data []byte
+		data, err = e.store.Get(ctx, f)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", f, err)
+		}
+		if err = os.WriteFile(localPath, data, 0600); err != nil {
 				return fmt.Errorf("writing local %s: %w", localPath, err)
 			}
 			e.uploadedMu.Lock()
@@ -279,7 +285,7 @@ func (e *Engine) recover(ctx context.Context) error {
 
 	e.dbMu.Lock()
 	if e.db != nil {
-		e.db.Close()
+		_ = e.db.Close()
 	}
 	e.db = db
 	e.dbMu.Unlock()
@@ -308,14 +314,14 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 		}
 		batch := e.db.NewBatch()
 		if err := batch.SetRepr(data); err != nil {
-			batch.Close()
+			_ = batch.Close()
 			return fmt.Errorf("setting WAL repr seq %d: %w", entry.Seq, err)
 		}
 		if err := e.db.Apply(batch, pebble.NoSync); err != nil {
-			batch.Close()
+			_ = batch.Close()
 			return fmt.Errorf("replaying WAL seq %d: %w", entry.Seq, err)
 		}
-		batch.Close()
+		_ = batch.Close()
 
 		e.mu.Lock()
 		if entry.Seq > e.maxWALSeq {
@@ -397,7 +403,7 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 // storage before returning.
 func (e *Engine) Set(ctx context.Context, key, value []byte) error {
 	batch := e.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := batch.Set(key, value, nil); err != nil {
 		return fmt.Errorf("engine: building set: %w", err)
@@ -414,7 +420,7 @@ func (e *Engine) Set(ctx context.Context, key, value []byte) error {
 // before returning.
 func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	batch := e.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := batch.Delete(key, nil); err != nil {
 		return fmt.Errorf("engine: building delete: %w", err)
@@ -465,7 +471,7 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	e.coldMissCount.Store(0)
 	result := make([]byte, len(val))
 	copy(result, val)
-	closer.Close()
+	_ = closer.Close()
 	return result, nil
 }
 
@@ -520,7 +526,7 @@ func (e *Engine) Metrics() *Metrics {
 // most recent background failure.
 func (e *Engine) Health() error {
 	if !e.healthy.Load() {
-		return fmt.Errorf("engine: unhealthy")
+		return errors.New("engine: unhealthy")
 	}
 	return nil
 }
@@ -567,10 +573,10 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	<-flushDone
 
 	checkpointDir := filepath.Join(e.localDir, ckptDir)
-	os.RemoveAll(checkpointDir)
-	defer os.RemoveAll(checkpointDir)
+	_ = os.RemoveAll(checkpointDir)
+	defer func() { _ = os.RemoveAll(checkpointDir) }()
 
-	if err := db.Checkpoint(checkpointDir); err != nil {
+	if err = db.Checkpoint(checkpointDir); err != nil {
 		return fmt.Errorf("engine: checkpoint: %w", err)
 	}
 
@@ -615,12 +621,13 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 			continue
 		}
 
-		localPath := filepath.Join(checkpointDir, entry.Name())
-		data, err := os.ReadFile(localPath)
+		localPath := filepath.Clean(filepath.Join(checkpointDir, entry.Name()))
+		var data []byte
+		data, err = os.ReadFile(localPath)
 		if err != nil {
 			return fmt.Errorf("engine: reading checkpoint file %s: %w", entry.Name(), err)
 		}
-		if err := e.store.Put(ctx, remotePath, data); err != nil {
+		if err = e.store.Put(ctx, remotePath, data); err != nil {
 			return fmt.Errorf("engine: uploading %s: %w", entry.Name(), err)
 		}
 
@@ -633,7 +640,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	for remotePath := range e.uploadedFiles {
 		base := filepath.Base(remotePath)
 		if !checkpointFiles[base] {
-			if err := e.store.Delete(ctx, remotePath); err != nil {
+			if err = e.store.Delete(ctx, remotePath); err != nil {
 				e.uploadedMu.Unlock()
 				return fmt.Errorf("engine: deleting stale file %s: %w", base, err)
 			}
@@ -649,8 +656,9 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		CreatedAt:   time.Now(),
 	}
 	for _, entry := range entries {
-		localPath := filepath.Join(checkpointDir, entry.Name())
-		data, err := os.ReadFile(localPath)
+		localPath := filepath.Clean(filepath.Join(checkpointDir, entry.Name()))
+		var data []byte
+		data, err = os.ReadFile(localPath)
 		if err != nil {
 			return fmt.Errorf("engine: reading %s for checksum: %w", entry.Name(), err)
 		}
@@ -669,11 +677,11 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	// Write versioned manifest first, then update the current manifest pointer.
 	// If the versioned write succeeds but the current pointer write fails,
 	// the versioned copy can be used for recovery.
-	if err := e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
+	if err = e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing versioned manifest: %w", err)
 	}
 
-	if err := e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
+	if err = e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing manifest: %w", err)
 	}
 
@@ -681,7 +689,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	if err == nil && len(oldVersions) > maxManifestHistory {
 		sort.Strings(oldVersions)
 		for _, v := range oldVersions[:len(oldVersions)-maxManifestHistory] {
-			e.store.Delete(ctx, v)
+			_ = e.store.Delete(ctx, v)
 		}
 	}
 
@@ -736,8 +744,8 @@ func (e *Engine) checkEviction() {
 		return
 	}
 
-	db.Compact(e.ctx, nil, nil, true)
-	e.Sync(e.ctx)
+	_ = db.Compact(e.ctx, nil, nil, true)
+	_ = e.Sync(e.ctx)
 }
 
 func (e *Engine) manifestPath() string {
@@ -765,7 +773,7 @@ func (e *Engine) Close() error {
 	if err := e.Sync(context.Background()); err != nil {
 		e.dbMu.RLock()
 		if e.db != nil {
-			e.db.Close()
+		_ = e.db.Close()
 		}
 		e.dbMu.RUnlock()
 		return fmt.Errorf("engine: final sync: %w", err)

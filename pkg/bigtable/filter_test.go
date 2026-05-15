@@ -706,7 +706,7 @@ func TestBuildEvaluatorChainNested(t *testing.T) {
 func TestFilterEngineProcess(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(nil)
 	if err != nil {
@@ -733,7 +733,7 @@ func TestFilterEngineProcess(t *testing.T) {
 func TestFilterEngineProcessWithBlockAll(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_BlockAllFilter{},
@@ -762,7 +762,7 @@ func TestFilterEngineProcessWithBlockAll(t *testing.T) {
 func TestFilterEngineProcessWithStop(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(nil)
 	if err != nil {
@@ -786,7 +786,7 @@ func TestFilterEngineProcessWithStop(t *testing.T) {
 func TestFilterEngineProcessStripValue(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_StripValueTransformer{},
@@ -817,7 +817,7 @@ func TestFilterEngineProcessStripValue(t *testing.T) {
 func TestFilterEngineProcessApplyLabel(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_ApplyLabelTransformer{
@@ -845,7 +845,7 @@ func TestFilterEngineProcessApplyLabel(t *testing.T) {
 func TestFilterEngineProcessRowKeyRegex(t *testing.T) {
 	s, table := setupTestTable(t)
 	iter := filterTestIter(t, s, table)
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_RowKeyRegexFilter{
@@ -883,7 +883,7 @@ func TestFilterEngineHasMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_RowKeyRegexFilter{
@@ -907,7 +907,7 @@ func TestFilterEngineHasMatchNoMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer iter.Close()
+	t.Cleanup(func() { _ = iter.Close() })
 
 	engine, err := newRowFilterEngine(&bigtablepb.RowFilter{
 		Filter: &bigtablepb.RowFilter_RowKeyRegexFilter{
@@ -1171,11 +1171,10 @@ func TestBuildEvaluatorRowSample(t *testing.T) {
 
 func TestValueRegexFilterViaReadRows(t *testing.T) {
 	s := newTestServer(t)
-	table := "projects/p/instances/i/tables/t"
-	populateTable(t, s, table)
+	populateTable(t, s, benchTable)
 
 	req := &bigtablepb.ReadRowsRequest{
-		TableName: table,
+		TableName: benchTable,
 		Filter: &bigtablepb.RowFilter{
 			Filter: &bigtablepb.RowFilter_ValueRegexFilter{
 				ValueRegexFilter: []byte("^v[12]$"),
