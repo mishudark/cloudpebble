@@ -636,19 +636,22 @@ func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 			continue
 		}
 
+		val := iter.Value()
+		if len(val) > 0 {
+			val = append([]byte(nil), val...)
+		}
 		ci := cellInfo{
 			rowKey:    rowKey,
 			family:    family,
 			qualifier: qualifier,
 			ts:        ts,
-			value:     iter.Value(),
+			value:     val,
 		}
 
 		if !e.eval.evaluate(ci) {
 			continue
 		}
 
-		val := ci.value
 		if stripValue {
 			val = nil
 		}
