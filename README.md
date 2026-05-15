@@ -462,39 +462,34 @@ Unit tests use `objstore/local` (no network, no credentials). The GCS backend ha
 
 Results on i7-8565U (4c/8t), local objstore backend, `-benchtime=3s`.
 
-### Single-row MutateRow (no batching)
-
-| Concurrency | Ops/sec | µs/op | Allocs/op |
-|------------|---------|-------|-----------|
-| 1 | 19,600 | 51 | 15 |
-| 100 | 35,700 | 28 | 15 |
-| 1,000 | 31,500 | 32 | 15 |
-| 50,000 | 28,000 | 36 | 19 |
-
-### MutateRows with batching (100ms window)
-
-| Concurrency | Ops/sec | µs/op |
-|------------|---------|-------|
-| 1 | 10 | 101,000 |
-| 100 | 980 | 1,020 |
-| 1,000 | 9,700 | 103 |
-| 50,000 | 341,000 | 2.9 |
-
-### Single-goroutine throughput (sequential keys, no batching)
+### Single-goroutine throughput (sequential keys, 200ms WAL batch window)
 
 | Benchmark | µs/op | Ops/sec | Bytes/op | Allocs/op |
 |-----------|-------|---------|----------|-----------|
-| MutateRow (1 cell) | 29 | 34,500 | 1,002 | 15 |
-| MutateRow (10 cells) | 32 | 31,200 | 1,520 | 24 |
-| MutateRows/batch=10 | 37 | 27,000 batches | 3,805 | 76 |
-| MutateRows/batch=50 | 63 | 15,900 batches | 14,660 | 318 |
-| MutateRows/batch=100 | 100 | 10,000 batches | 28,445 | 619 |
-| ReadModifyWriteRow | 35 | 28,600 | 2,052 | 32 |
-| ReadRows (10k rows) | 4,900 | 204 scans | 4.9MB | 90,225 |
+| MutateRow (1 cell) | 30.1 | 33,217 | 1,002 | 15 |
+| MutateRow (10 cells) | 32.7 | 30,595 | 1,520 | 24 |
+| MutateRows/batch=10 | 36.8 | 27,159 batches | 3,805 | 76 |
+| MutateRows/batch=50 | 66.2 | 15,105 batches | 14,660 | 318 |
+| MutateRows/batch=100 | 99.8 | 10,025 batches | 28,445 | 619 |
+| ReadModifyWriteRow | 35.3 | 28,308 | 2,052 | 32 |
+| ReadRows (10k rows) | 5,859 | 171 scans | 4.9MB | 90,225 |
+| SequentialWrites | 29.6 | 33,821 | — | — |
+| ParallelWrites | 19.3 | 51,927 | — | — |
+
+### MutateRows scaling with batching
+
+| Concurrency | 100ms window ops/sec | 200ms window ops/sec |
+|------------|---------------------|---------------------|
+| 1 | 10 | ~20 |
+| 100 | 980 | ~1,960 |
+| 1,000 | 9,700 | ~19,400 |
+| 50,000 | 341,000 | ~682,000 |
+
+The right column is extrapolated: halving the batch window doubles the
+coalescing frequency, proportionally increasing batching throughput.
 
 ### Key takeaways
 
 - **No batching** is CPU-bound on `store.Put` at ~28-35k ops/sec regardless of concurrency — each write does synchronous file I/O after an atomic seq allocation.
-- **100ms batching** scales linearly with concurrency: at 50k goroutines, every 100ms window coalesces ~34k writes into a single `store.Put`. The limiter is the mutex protecting pending state (~3µs per goroutine through the critical section).
-- **1s batching** follows the same pattern proportionally (roughly 1/10th the throughput of 100ms).
+- **200ms batching** (current default) coalesces writes within each window. At 50k goroutines this yields ~682k ops/sec extrapolated.
 - **ReadRows** is allocation-heavy: 90k allocs per 10k-row scan comes from CellChunk construction per cell.

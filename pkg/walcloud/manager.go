@@ -133,6 +133,8 @@ func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, don
 
 // flushPending merges all pending segments into a single valid batch repr,
 // writes it to object storage, and wakes all waiters. Called by the timer.
+// The object storage Put runs in a goroutine so the next batch window can
+// start accumulating immediately rather than waiting for the GCS roundtrip.
 func (m *Manager) flushPending() {
 	m.mu.Lock()
 	segments := m.pending
@@ -147,19 +149,18 @@ func (m *Manager) flushPending() {
 		return
 	}
 
-	// Merge all segments into one valid Pebble batch repr.
-	// Cost is O(total_size) paid once here, not per-writer in WriteRecord.
 	data := mergeBatchSegments(segments)
-
-	var gcsErr error
 	p := m.walPath(seq)
-	if err := m.store.Put(context.Background(), p, data); err != nil {
-		gcsErr = fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
-	}
 
-	for _, ch := range waiters {
-		ch <- gcsErr
-	}
+	go func() {
+		var gcsErr error
+		if err := m.store.Put(context.Background(), p, data); err != nil {
+			gcsErr = fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
+		}
+		for _, ch := range waiters {
+			ch <- gcsErr
+		}
+	}()
 }
 
 // batchHeaderLen is the Pebble batch repr header size (seqnum + count).

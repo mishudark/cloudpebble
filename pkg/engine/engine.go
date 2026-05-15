@@ -166,7 +166,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		opts.OrphanWALTTL = 1 * time.Hour
 	}
 	if opts.BatchWindow == 0 {
-		opts.BatchWindow = 1 * time.Second
+		opts.BatchWindow = 200 * time.Millisecond
 	}
 	if opts.PebbleOptions == nil {
 		opts.PebbleOptions = &pebble.Options{}
