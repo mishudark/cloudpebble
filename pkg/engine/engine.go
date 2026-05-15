@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -256,25 +257,20 @@ func (e *Engine) recover(ctx context.Context) error {
 
 		e.manifestVersion = m.Version
 
-		dataPrefix := e.dataPrefix()
-		var files []string
-		files, err = e.store.List(ctx, dataPrefix)
-		if err != nil {
-			return fmt.Errorf("listing data files: %w", err)
-		}
-		for _, f := range files {
-			localName := filepath.Base(f)
-			localPath := filepath.Join(e.localDir, localName)
-		var data []byte
-		data, err = e.store.Get(ctx, f)
-		if err != nil {
-			return fmt.Errorf("downloading %s: %w", f, err)
-		}
-		if err = os.WriteFile(localPath, data, 0600); err != nil {
+		for _, mf := range m.Files {
+			remotePath := filepath.ToSlash(filepath.Join(e.dataPrefix(), mf.Name))
+			localPath := filepath.Join(e.localDir, mf.Name)
+			var data []byte
+			data, err = e.store.Get(ctx, remotePath)
+			if err != nil {
+				return fmt.Errorf("downloading %s: %w", remotePath, err)
+			}
+			err = os.WriteFile(localPath, data, 0600)
+			if err != nil {
 				return fmt.Errorf("writing local %s: %w", localPath, err)
 			}
 			e.uploadedMu.Lock()
-			e.uploadedFiles[f] = struct{}{}
+			e.uploadedFiles[remotePath] = struct{}{}
 			e.uploadedMu.Unlock()
 		}
 
@@ -585,6 +581,10 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	}
 	<-flushDone
 
+	if err = e.walMgr.Flush(ctx); err != nil {
+		return fmt.Errorf("engine: flushing WAL batch: %w", err)
+	}
+
 	checkpointDir := filepath.Join(e.localDir, ckptDir)
 	_ = os.RemoveAll(checkpointDir)
 	defer func() { _ = os.RemoveAll(checkpointDir) }()
@@ -604,16 +604,11 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	e.mu.Unlock()
 
 	isMutable := func(name string) bool {
-		switch name {
-		case "MANIFEST",
-			"OPTIONS",
-			"marker.format-version",
-			"marker.manifest",
-			"CURRENT":
-			return true
-		default:
-			return false
-		}
+		return name == "CURRENT" ||
+			strings.HasPrefix(name, "MANIFEST-") ||
+			strings.HasPrefix(name, "OPTIONS-") ||
+			strings.HasPrefix(name, "marker.format-version") ||
+			strings.HasPrefix(name, "marker.manifest")
 	}
 
 	checkpointFiles := make(map[string]bool, len(entries))
