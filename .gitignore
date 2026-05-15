@@ -13,6 +13,8 @@ test-coldmiss
 
 # Test binary
 *.test
+test-bigtable-client
+test-gcs-writes
 
 # Output of go coverage
 *.out

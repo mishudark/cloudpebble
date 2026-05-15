@@ -78,7 +78,7 @@ func TestReadRowsValuesSurviveIteratorMove(t *testing.T) {
 
 	got := make(map[string]int)
 	for _, c := range allChunks {
-		if c.GetCommitRow() || c.GetResetRow() {
+		if c.GetResetRow() {
 			continue
 		}
 		if len(c.Value) == 0 && c.ValueSize == 0 {
@@ -128,9 +128,9 @@ func TestReadRowsSingleKey(t *testing.T) {
 		allChunks = append(allChunks, resp.Chunks...)
 	}
 
-	// Expect 3 data chunks (3 cells in row1) + 1 commit row.
-	if len(allChunks) != 4 {
-		t.Fatalf("expected 4 chunks (3 data + 1 commit), got %d", len(allChunks))
+	// Expect 3 chunks (3 cells, last with commit_row).
+	if len(allChunks) != 3 {
+		t.Fatalf("expected 3 chunks, got %d", len(allChunks))
 	}
 
 	// First chunk should have row_key set.
@@ -141,10 +141,9 @@ func TestReadRowsSingleKey(t *testing.T) {
 		t.Fatalf("row key mismatch: got %q", allChunks[0].RowKey)
 	}
 
-	// Last chunk should be commit row.
-	last := allChunks[len(allChunks)-1]
-	if !last.GetCommitRow() {
-		t.Fatal("last chunk should be commit row")
+	// Last chunk should have commit_row.
+	if !allChunks[len(allChunks)-1].GetCommitRow() {
+		t.Fatal("last chunk should have commit_row")
 	}
 }
 
@@ -294,15 +293,12 @@ func TestReadRowsWithFilter(t *testing.T) {
 		allChunks = append(allChunks, resp.Chunks...)
 	}
 
-	// Should get 2 data chunks (cf1:a and cf1:b) + 1 commit row.
-	if len(allChunks) != 3 {
-		t.Fatalf("expected 3 chunks (2 data + 1 commit), got %d", len(allChunks))
+	// Should get 2 chunks (cf1:a and cf1:b, last with commit_row).
+	if len(allChunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(allChunks))
 	}
 
 	for _, c := range allChunks {
-		if c.GetCommitRow() {
-			continue
-		}
 		fam := c.GetFamilyName().GetValue()
 		if fam != "cf1" {
 			t.Fatalf("expected family cf1, got %q", fam)
@@ -331,13 +327,9 @@ func TestReadRowsBlockAllFilter(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// All data cells filtered, but commit row chunk is still emitted.
-	// The response should contain only the commit row marker.
-	if len(stream.sent) == 0 {
-		t.Fatal("expected a response with commit row")
-	}
-	if len(stream.sent[0].Chunks) != 1 || !stream.sent[0].Chunks[0].GetCommitRow() {
-		t.Fatal("expected only a commit row chunk")
+	// All data cells filtered — no rows should be emitted.
+	if len(stream.sent) != 0 {
+		t.Fatalf("expected no responses, got %d", len(stream.sent))
 	}
 }
 

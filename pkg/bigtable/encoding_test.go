@@ -279,11 +279,19 @@ func TestKeyHasRowPrefix(t *testing.T) {
 
 func TestEncodeRowPrefix(t *testing.T) {
 	rp := encodeRowPrefix([]byte("hello"))
-	if len(rp) != 2+5+1 {
-		t.Fatalf("prefix length: got %d, want 8", len(rp))
+	// "hello" has no null bytes, so escaped form = "hello", + 0x00 0x00 = 7 bytes.
+	if len(rp) != len("hello")+2 {
+		t.Fatalf("prefix length: got %d, want %d", len(rp), len("hello")+2)
 	}
-	if rp[2] != 'h' || rp[6] != 'o' || rp[7] != 0x00 {
-		t.Fatal("unexpected prefix contents")
+	// Row key bytes should match input.
+	for i := 0; i < len("hello"); i++ {
+		if rp[i] != "hello"[i] {
+			t.Fatalf("row key byte %d: got %02x, want %02x", i, rp[i], "hello"[i])
+		}
+	}
+	// Terminator should be 0x00 0x00.
+	if rp[len("hello")] != 0x00 || rp[len("hello")+1] != 0x00 {
+		t.Fatal("expected 0x00 0x00 terminator")
 	}
 }
 
