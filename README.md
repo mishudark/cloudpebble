@@ -1,6 +1,6 @@
 # CloudPebble
 
-CloudPebble is a [Google Cloud Bigtable v2](https://cloud.google.com/bigtable/docs/reference/data-plane/rpc)-compatible wide-column database built on [Pebble](https://github.com/cockroachdb/pebble) with durable object storage persistence implementing an architecture similar to [turbopuffer](https://turbopuffer.com/docs/architecture). You can use the official `cloud.google.com/go/bigtable` client library or any Bigtable v2 SDK to read and write data, with durable object-storage persistence under the hood.
+CloudPebble is a [Google Cloud Bigtable v2](https://cloud.google.com/bigtable/docs/reference/data-plane/rpc) compatible wide-column database built on [Pebble](https://github.com/cockroachdb/pebble). You can use the official `cloud.google.com/go/bigtable` client library or any Bigtable v2 SDK to read and write data, with durable object-storage persistence implementing an architecture similar to [turbopuffer](https://turbopuffer.com/docs/architecture).
 
 A local Pebble instance serves as a read-optimized NVMe/SSD cache. All writes are durably committed to object storage via a write-ahead log. Data is asynchronously indexed into SSTs and uploaded for cold reads and crash recovery.
 
