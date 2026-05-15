@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	hourInterval  = 3600 * time.Second
-	fastBatch     = 1 * time.Millisecond // tiny window for fast unit tests
+	hourInterval = 3600 * time.Second
+	fastBatch    = 1 * time.Millisecond // tiny window for fast unit tests
 )
 
 // newTestEngine creates an engine tied to the test lifetime (Close on cleanup).
@@ -250,10 +250,10 @@ func TestMetricsCounters(t *testing.T) {
 	e := newTestEngine(t, "ns-metrics")
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		requireNoErr(t, e.Set(ctx, []byte{byte(i)}, []byte{byte(i)}))
 	}
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		_, err := e.Get([]byte{byte(i)})
 		requireNoErr(t, err)
 	}
@@ -303,13 +303,13 @@ func TestMultipleKeys(t *testing.T) {
 	ctx := context.Background()
 
 	n := 20
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := []byte{byte(i)}
 		v := []byte{byte(i + 1)}
 		requireNoErr(t, e.Set(ctx, k, v))
 	}
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := []byte{byte(i)}
 		want := []byte{byte(i + 1)}
 		got, err := e.Get(k)
@@ -336,10 +336,10 @@ func TestConcurrentCrashRecovery(t *testing.T) {
 	ctx := context.Background()
 
 	errCh := make(chan error, workers*keysPerWorker)
-	for w := 0; w < workers; w++ {
+	for w := range workers {
 		w := w
 		go func() {
-			for k := 0; k < keysPerWorker; k++ {
+			for k := range keysPerWorker {
 				key := []byte{byte(w), byte(k >> 8), byte(k)}
 				val := []byte{byte(w), byte(k >> 8), byte(k), 0xff}
 				if err := e1.Set(ctx, key, val); err != nil {
@@ -351,7 +351,7 @@ func TestConcurrentCrashRecovery(t *testing.T) {
 		}()
 	}
 
-	for i := 0; i < workers; i++ {
+	for range workers {
 		if err := <-errCh; err != nil {
 			t.Fatal(err)
 		}
@@ -360,7 +360,7 @@ func TestConcurrentCrashRecovery(t *testing.T) {
 	requireNoErr(t, e1.Sync(ctx))
 
 	// Write some keys post-sync (WAL-only).
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := []byte{0xff, byte(i)}
 		v := []byte{0xfe, byte(i)}
 		requireNoErr(t, e1.Set(ctx, k, v))
@@ -374,8 +374,8 @@ func TestConcurrentCrashRecovery(t *testing.T) {
 	defer func() { _ = e2.Close() }()
 
 	// Verify all pre-sync keys.
-	for w := 0; w < workers; w++ {
-		for k := 0; k < keysPerWorker; k++ {
+	for w := range workers {
+		for k := range keysPerWorker {
 			key := []byte{byte(w), byte(k >> 8), byte(k)}
 			want := []byte{byte(w), byte(k >> 8), byte(k), 0xff}
 			got, err := e2.Get(key)
@@ -389,7 +389,7 @@ func TestConcurrentCrashRecovery(t *testing.T) {
 	}
 
 	// Verify all post-sync (WAL-only) keys.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := []byte{0xff, byte(i)}
 		want := []byte{0xfe, byte(i)}
 		got, err := e2.Get(k)

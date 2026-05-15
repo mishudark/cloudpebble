@@ -220,10 +220,7 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 	}
 	totalSize := len(value)
 	for offset := 0; offset < totalSize; offset += maxCellChunkValueSize {
-		end := offset + maxCellChunkValueSize
-		if end > totalSize {
-			end = totalSize
-		}
+		end := min(offset+maxCellChunkValueSize, totalSize)
 		var chunk *bigtablepb.ReadRowsResponse_CellChunk
 		if offset == 0 {
 			chunk = cellChunk(rowKey, family, qualifier, timestampMicros, value[offset:end], nil)

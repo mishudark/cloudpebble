@@ -18,11 +18,11 @@ func populateTable(t *testing.T, s *Server, table string) {
 	db := eng.DB()
 
 	data := []struct {
-		row     string
-		fam     string
-		qual    string
-		ts      int64
-		val     string
+		row  string
+		fam  string
+		qual string
+		ts   int64
+		val  string
 	}{
 		{"row1", "cf1", "a", 100, "v1"},
 		{"row1", "cf1", "b", 200, "v2"},
@@ -51,9 +51,9 @@ func TestReadRowsValuesSurviveIteratorMove(t *testing.T) {
 	db := eng.DB()
 
 	// Write enough cells across rows to span multiple SST blocks.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		row := fmt.Sprintf("row-%03d", i)
-		for j := 0; j < 5; j++ {
+		for j := range 5 {
 			key := EncodeCellKey([]byte(row), "cf", []byte{byte(j)}, 1000+int64(j))
 			val := fmt.Sprintf("val-%03d-%d", i, j)
 			if err := db.Set(key, []byte(val), pebble.NoSync); err != nil {
@@ -87,8 +87,8 @@ func TestReadRowsValuesSurviveIteratorMove(t *testing.T) {
 		got[string(c.Value)]++
 	}
 
-	for i := 0; i < 100; i++ {
-		for j := 0; j < 5; j++ {
+	for i := range 100 {
+		for j := range 5 {
 			want := fmt.Sprintf("val-%03d-%d", i, j)
 			if got[want] != 1 {
 				t.Fatalf("value %q: got count %d, want 1; total unique=%d, chunks=%d", want, got[want], len(got), len(allChunks))
@@ -508,7 +508,7 @@ func TestReadRowsWithMultipleScenarios(t *testing.T) {
 	// Write many cells across rows to trigger chunk buffering.
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
-	for i := 0; i < 150; i++ {
+	for i := range 150 {
 		key := EncodeCellKey([]byte("row"), "cf", []byte("q"), int64(i))
 		if err := db.Set(key, []byte("data"), pebble.NoSync); err != nil {
 			t.Fatal(err)

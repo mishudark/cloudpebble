@@ -125,7 +125,7 @@ type Engine struct {
 	mu        sync.Mutex
 	maxWALSeq uint64
 
-	syncMu       sync.Mutex
+	syncMu        sync.Mutex
 	uploadedMu    sync.Mutex
 	uploadedFiles map[string]struct{}
 
@@ -485,9 +485,7 @@ func (e *Engine) triggerColdRecovery() {
 	if !e.recovering.CompareAndSwap(false, true) {
 		return
 	}
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
+	e.wg.Go(func() {
 		defer e.recovering.Store(false)
 		defer e.coldMissCount.Store(0)
 
@@ -503,7 +501,7 @@ func (e *Engine) triggerColdRecovery() {
 			default:
 			}
 		}
-	}()
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +665,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		PrevVersion: e.manifestVersion,
 		MaxWALSeq:   currentSeq,
 		CreatedAt:   time.Now(),
-		Files:        manifestFiles,
+		Files:       manifestFiles,
 	}
 	manifestBytes, err := json.Marshal(mf)
 	if err != nil {
@@ -775,7 +773,7 @@ func (e *Engine) Close() error {
 	if err := e.Sync(context.Background()); err != nil {
 		e.dbMu.RLock()
 		if e.db != nil {
-		_ = e.db.Close()
+			_ = e.db.Close()
 		}
 		e.dbMu.RUnlock()
 		return fmt.Errorf("engine: final sync: %w", err)

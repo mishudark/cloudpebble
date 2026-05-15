@@ -64,7 +64,7 @@ func TestSequenceNumbersMonotonic(t *testing.T) {
 	ctx := context.Background()
 
 	var prev uint64
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		seq, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i)))
 		if err != nil {
 			t.Fatal(err)
@@ -83,7 +83,7 @@ func TestListOrdered(t *testing.T) {
 	mgr := newTestManager(t, "ns", 0)
 	ctx := context.Background()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestGC(t *testing.T) {
 	mgr := newTestManager(t, "ns", 0)
 	ctx := context.Background()
 
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +138,7 @@ func TestGC_OrphanTTL(t *testing.T) {
 	mgr := newTestManager(t, "ns", 0)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
 			t.Fatal(err)
 		}
@@ -173,7 +173,7 @@ func TestRecoveryFromExisting(t *testing.T) {
 	// Create first manager, write some WALs.
 	mgr1, _ := walcloud.NewManager(store, "ns", 0)
 	ctx := context.Background()
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		if _, _, writeErr := mgr1.WriteRecord(ctx, []byte("x")); writeErr != nil {
 			t.Fatal(writeErr)
 		}
@@ -248,7 +248,7 @@ func TestNoBatching(t *testing.T) {
 	mgr := newTestManager(t, "ns", 0)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		seq, done, err := mgr.WriteRecord(ctx, []byte("data"))
 		if err != nil {
 			t.Fatal(err)

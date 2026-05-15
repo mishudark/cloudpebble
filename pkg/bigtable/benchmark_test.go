@@ -16,12 +16,13 @@ const benchTable = "projects/p/instances/i/tables/t"
 // sequentialKey returns a deterministic consecutive row key so benchmarks
 // measure true ingest (new keys), not overwrite.
 func sequentialKey(i int) []byte {
-	return []byte(fmt.Sprintf("row_%012d", i))
+	return fmt.Appendf(nil, "row_%012d", i)
 }
 
 // BenchmarkMutateRow measures single-row mutations per second.
 // Every write goes through the full cloudpebble engine path:
-//   engine.Apply → WAL write to object storage → Pebble apply.
+//
+//	engine.Apply → WAL write to object storage → Pebble apply.
 func BenchmarkMutateRow(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
@@ -65,7 +66,7 @@ func BenchmarkMutateRowMultiCell(b *testing.B) {
 			Mutation: &bigtablepb.Mutation_SetCell_{
 				SetCell: &bigtablepb.Mutation_SetCell{
 					FamilyName:      "cf",
-					ColumnQualifier: []byte(fmt.Sprintf("q%03d", i)),
+					ColumnQualifier: fmt.Appendf(nil, "q%03d", i),
 					TimestampMicros: -1,
 					Value:           make([]byte, 64),
 				},
@@ -177,7 +178,7 @@ func BenchmarkReadRows(b *testing.B) {
 	eng := openTableEngine(b, s, table)
 	db := eng.DB()
 
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		key := EncodeCellKey(sequentialKey(i), "cf", []byte("q"), int64(i))
 		if err := db.Set(key, make([]byte, 256), pebble.NoSync); err != nil {
 			b.Fatal(err)
