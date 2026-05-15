@@ -22,6 +22,7 @@ package walcloud
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"path"
 	"sort"
@@ -44,6 +45,7 @@ const (
 type Manager struct {
 	store objstore.Store
 	ns    string
+	ctx   context.Context
 
 	batchWindow time.Duration // 0 = no batching
 
@@ -51,10 +53,11 @@ type Manager struct {
 	nextSeq uint64
 
 	// Batching state. Protected by mu.
-	pending    [][]byte      // batch repr segments for current window
-	pendingSeq uint64
-	waiters    []chan error  // callers waiting for this batch to commit
+	pending     [][]byte     // batch repr segments for current window
+	pendingSeq  uint64
+	waiters     []chan error // callers waiting for this batch to commit
 	commitTimer *time.Timer
+	closed      atomic.Bool
 }
 
 // NewManager creates a new WAL manager for the given namespace.
@@ -83,6 +86,23 @@ func NewManager(store objstore.Store, namespace string, batchWindow time.Duratio
 	return m, nil
 }
 
+// SetContext sets the context used for background operations such as
+// batch flush goroutines.
+func (m *Manager) SetContext(ctx context.Context) {
+	m.ctx = ctx
+}
+
+// Close stops the timer and prevents further writes.
+func (m *Manager) Close() {
+	m.closed.Store(true)
+	m.mu.Lock()
+	if m.commitTimer != nil {
+		m.commitTimer.Stop()
+		m.commitTimer = nil
+	}
+	m.mu.Unlock()
+}
+
 // walPath returns the full object store path for a WAL with the given seq.
 func (m *Manager) walPath(seq uint64) string {
 	return path.Join(m.ns, walDir, fmt.Sprintf("%0*d%s", seqNumWidth, seq, walExt))
@@ -105,6 +125,9 @@ func (m *Manager) walPrefix() string {
 //
 // Sequence numbers are assigned monotonically and returned immediately.
 func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, done <-chan error, err error) {
+	if m.closed.Load() {
+		return 0, nil, errors.New("walcloud: manager is closed")
+	}
 	if m.batchWindow <= 0 {
 		// Direct write path: no mutex at all.
 		// Sequence numbers are allocated atomically so writes are fully
@@ -127,9 +150,10 @@ func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, don
 	m.pending = append(m.pending, data)
 	ch := make(chan error, 1)
 	m.waiters = append(m.waiters, ch)
+	seq = m.pendingSeq
 	m.mu.Unlock()
 
-	return m.pendingSeq, ch, nil
+	return seq, ch, nil
 }
 
 // flushPending merges all pending segments into a single valid batch repr,
@@ -155,7 +179,11 @@ func (m *Manager) flushPending() {
 
 	go func() {
 		var gcsErr error
-		if err := m.store.Put(context.Background(), p, data); err != nil {
+		ctx := m.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		if err := m.store.Put(ctx, p, data); err != nil {
 			gcsErr = fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
 		}
 		for _, ch := range waiters {

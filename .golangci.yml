@@ -63,9 +63,14 @@ linters:
     staticcheck:
       checks: ["all"]
 
-issues:
-  exclude-rules:
-    - path: "*_test.go"
-      linters: [errcheck, gosec]
-    - path: "*/bigtablepb/*"
-      linters: [unused, govet]
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - goconst
+      - path: /bigtablepb/
+        linters:
+          - unused
+          - govet
