@@ -38,7 +38,7 @@ func newTestServer(t testing.TB) *Server {
 			BatchWindow: -1, // disable WAL batching for speed
 		},
 	}
-	t.Cleanup(func() { s.Close() })
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 
@@ -56,7 +56,7 @@ func openTableEngine(t testing.TB, s *Server, tableName string) *engine.Engine {
 func TestReadModifyWriteRowAppendMissing(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
 		TableName: table,
@@ -90,7 +90,7 @@ func TestReadModifyWriteRowAppendMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, []byte("hello")) {
 		t.Fatalf("value mismatch: got %q, want %q", val, "hello")
 	}
@@ -99,7 +99,7 @@ func TestReadModifyWriteRowAppendMissing(t *testing.T) {
 func TestReadModifyWriteRowAppendExisting(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -138,7 +138,7 @@ func TestReadModifyWriteRowAppendExisting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, want) {
 		t.Fatalf("value mismatch: got %q, want %q", val, want)
 	}
@@ -147,7 +147,7 @@ func TestReadModifyWriteRowAppendExisting(t *testing.T) {
 func TestReadModifyWriteRowIncrementMissing(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
 		TableName: table,
@@ -179,7 +179,7 @@ func TestReadModifyWriteRowIncrementMissing(t *testing.T) {
 func TestReadModifyWriteRowIncrementExisting(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	existing := make([]byte, 8)
@@ -220,7 +220,7 @@ func TestReadModifyWriteRowIncrementExisting(t *testing.T) {
 func TestReadModifyWriteRowIncrementInvalidSize(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -256,7 +256,7 @@ func TestReadModifyWriteRowIncrementInvalidSize(t *testing.T) {
 func TestReadModifyWriteRowMultipleRules(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
 		TableName: table,
@@ -297,7 +297,7 @@ func TestReadModifyWriteRowMultipleRules(t *testing.T) {
 			if err != nil {
 				t.Fatalf("get failed: %v", err)
 			}
-			defer closer.Close()
+			defer func() { _ = closer.Close() }()
 			if fam.Name == "cf1" && string(col.Qualifier) == "a" {
 				if !bytes.Equal(val, []byte("A")) {
 					t.Fatalf("cf1:a value mismatch: got %q", val)
@@ -315,7 +315,7 @@ func TestReadModifyWriteRowMultipleRules(t *testing.T) {
 func TestReadModifyWriteRowSequentialRules(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	db := eng.DB()
@@ -363,7 +363,7 @@ func TestReadModifyWriteRowSequentialRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get failed: %v", err)
 	}
-	defer closer.Close()
+	defer func() { _ = closer.Close() }()
 	if !bytes.Equal(val, want) {
 		t.Fatalf("value mismatch: got %q, want %q", val, want)
 	}
@@ -374,7 +374,7 @@ func TestReadModifyWriteRowMissingRowKey(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: benchTable,
 		Rules: []*bigtablepb.ReadModifyWriteRule{
 			{
 				FamilyName:      "cf",
@@ -401,7 +401,7 @@ func TestReadModifyWriteRowMissingRules(t *testing.T) {
 	ctx := context.Background()
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
-		TableName: "projects/p/instances/i/tables/t",
+		TableName: benchTable,
 		RowKey:    []byte("row1"),
 	}
 
@@ -418,7 +418,7 @@ func TestReadModifyWriteRowMissingRules(t *testing.T) {
 func TestReadModifyWriteRowResponseStructure(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
 		TableName: table,
@@ -475,7 +475,7 @@ func TestReadModifyWriteRowResponseStructure(t *testing.T) {
 func TestReadModifyWriteRowNegativeIncrement(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/t"
+	table := benchTable
 
 	eng := openTableEngine(t, s, table)
 	existing := make([]byte, 8)

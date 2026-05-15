@@ -49,7 +49,7 @@ func newTestEngine(t testing.TB, ns string, opts ...func(*engine.Options)) *engi
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { e.Close() })
+	t.Cleanup(func() { _ = e.Close() })
 	return e
 }
 
@@ -87,11 +87,11 @@ func newTestEngineNoCleanup(t testing.TB, ns string, dir, objDir string, opts ..
 // crash where in-memory state is lost but GCS data survives.
 func simulateCrash(t testing.TB, e *engine.Engine, dir string) {
 	t.Helper()
-	e.DB().Close()
+	_ = e.DB().Close()
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -127,13 +127,13 @@ func TestSetCheckpointRecover(t *testing.T) {
 	e1 := newTestEngineNoCleanup(t, ns, dir, objDir)
 	requireNoErr(t, e1.Set(context.Background(), []byte("k1"), []byte("v1")))
 	requireNoErr(t, e1.Sync(context.Background()))
-	e1.Close()
+	_ = e1.Close()
 
-	os.RemoveAll(dir)
-	os.MkdirAll(dir, 0755)
+	requireNoErr(t, os.RemoveAll(dir))
+	requireNoErr(t, os.MkdirAll(dir, 0750))
 
 	e2 := newTestEngineNoCleanup(t, ns, dir, objDir)
-	defer e2.Close()
+	defer func() { _ = e2.Close() }()
 
 	got, err := e2.Get([]byte("k1"))
 	requireNoErr(t, err)
@@ -152,7 +152,7 @@ func TestCrashRecovery(t *testing.T) {
 	simulateCrash(t, e1, dir)
 
 	e2 := newTestEngineNoCleanup(t, ns, dir, objDir)
-	defer e2.Close()
+	defer func() { _ = e2.Close() }()
 
 	got, err := e2.Get([]byte("k1"))
 	requireNoErr(t, err)
@@ -170,10 +170,10 @@ func TestIncrementalUpload(t *testing.T) {
 
 	store, _ := local.New(objDir)
 	e := newTestEngineNoCleanup(t, ns, dir, objDir)
-	defer e.Close()
+	defer func() { _ = e.Close() }()
 
-	e.Set(context.Background(), []byte("k1"), []byte("v1"))
-	e.Set(context.Background(), []byte("k2"), []byte("v2"))
+	requireNoErr(t, e.Set(context.Background(), []byte("k1"), []byte("v1")))
+	requireNoErr(t, e.Set(context.Background(), []byte("k2"), []byte("v2")))
 
 	requireNoErr(t, e.Sync(context.Background()))
 	files1, _ := store.List(context.Background(), ns+"/data/")
@@ -186,7 +186,7 @@ func TestIncrementalUpload(t *testing.T) {
 		t.Fatalf("files changed on no-op sync: %d -> %d", n1, n2)
 	}
 
-	e.Set(context.Background(), []byte("k3"), []byte("v3"))
+	requireNoErr(t, e.Set(context.Background(), []byte("k3"), []byte("v3")))
 	requireNoErr(t, e.Sync(context.Background()))
 	files3, _ := store.List(context.Background(), ns+"/data/")
 	n3 := len(files3)
@@ -201,15 +201,15 @@ func TestStrongConsistency(t *testing.T) {
 	ns := "ns-strong"
 
 	e1 := newTestEngineNoCleanup(t, ns, dir, objDir)
-	e1.Set(context.Background(), []byte("k1"), []byte("synced"))
-	e1.Sync(context.Background())
-	e1.Set(context.Background(), []byte("k2"), []byte("in-wal"))
+	requireNoErr(t, e1.Set(context.Background(), []byte("k1"), []byte("synced")))
+	requireNoErr(t, e1.Sync(context.Background()))
+	requireNoErr(t, e1.Set(context.Background(), []byte("k2"), []byte("in-wal")))
 	simulateCrash(t, e1, dir)
 
 	e2 := newTestEngineNoCleanup(t, ns, dir, objDir,
 		func(o *engine.Options) { o.Consistency = engine.ConsistencyStrong },
 	)
-	defer e2.Close()
+	defer func() { _ = e2.Close() }()
 
 	v, err := e2.Get([]byte("k1"))
 	requireNoErr(t, err)
@@ -226,15 +226,15 @@ func TestEventualConsistency(t *testing.T) {
 	ns := "ns-eventual"
 
 	e1 := newTestEngineNoCleanup(t, ns, dir, objDir)
-	e1.Set(context.Background(), []byte("k1"), []byte("synced"))
-	e1.Sync(context.Background())
-	e1.Set(context.Background(), []byte("k2"), []byte("in-wal"))
+	requireNoErr(t, e1.Set(context.Background(), []byte("k1"), []byte("synced")))
+	requireNoErr(t, e1.Sync(context.Background()))
+	requireNoErr(t, e1.Set(context.Background(), []byte("k2"), []byte("in-wal")))
 	simulateCrash(t, e1, dir)
 
 	e2 := newTestEngineNoCleanup(t, ns, dir, objDir,
 		func(o *engine.Options) { o.Consistency = engine.ConsistencyEventual },
 	)
-	defer e2.Close()
+	defer func() { _ = e2.Close() }()
 
 	v, err := e2.Get([]byte("k1"))
 	requireNoErr(t, err)

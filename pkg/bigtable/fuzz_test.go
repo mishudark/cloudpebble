@@ -63,7 +63,7 @@ func FuzzEncodeCellKeyRoundTrip(f *testing.F) {
 		}
 
 		key := EncodeCellKey(rowKey, family, qualifier, ts)
-		dRow, dFamily, dQual, dTs, ok := DecodeCellKey(key)
+		dRow, dFamily, dQual, dTS, ok := DecodeCellKey(key)
 		if !ok {
 			t.Fatalf("DecodeCellKey failed on encoded key")
 		}
@@ -76,8 +76,8 @@ func FuzzEncodeCellKeyRoundTrip(f *testing.F) {
 		if !bytes.Equal(dQual, qualifier) {
 			t.Errorf("qualifier mismatch: got %v, want %v", dQual, qualifier)
 		}
-		if dTs != ts {
-			t.Errorf("timestamp mismatch: got %d, want %d", dTs, ts)
+		if dTS != ts {
+			t.Errorf("timestamp mismatch: got %d, want %d", dTS, ts)
 		}
 	})
 }
@@ -105,12 +105,12 @@ func FuzzKeySortOrder(f *testing.F) {
 		if bytes.Equal(rowA, rowB) && tsA < tsB && bytes.Compare(keyA, keyB) <= 0 {
 			t.Errorf("older timestamp should sort last")
 		}
-		if bytes.Equal(rowA, rowB) && tsA == tsB && bytes.Compare(keyA, keyB) != 0 {
+		if bytes.Equal(rowA, rowB) && tsA == tsB && !bytes.Equal(keyA, keyB) {
 			t.Errorf("same row+ts should produce equal keys")
 		}
 
 		// Different row keys: encoded keys should not be equal.
-		if !bytes.Equal(rowA, rowB) && bytes.Compare(keyA, keyB) == 0 {
+		if !bytes.Equal(rowA, rowB) && bytes.Equal(keyA, keyB) {
 			t.Errorf("different row keys should produce different encoded keys")
 		}
 	})

@@ -30,8 +30,8 @@ func main() {
 
 	switch os.Args[1] {
 	case "step1":
-		os.RemoveAll(dir)
-		os.RemoveAll(objDir)
+		_ = os.RemoveAll(dir)
+		_ = os.RemoveAll(objDir)
 		store, err = local.New(objDir)
 		if err != nil {
 			log.Fatal(err)
@@ -42,18 +42,18 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		e.Set(context.Background(), []byte("k1"), []byte("synced"))
-		e.Sync(context.Background())
+		_ = e.Set(context.Background(), []byte("k1"), []byte("synced"))
+		_ = e.Sync(context.Background())
 
 		// Write k2 WITHOUT syncing — only in GCS WAL
-		e.Set(context.Background(), []byte("k2"), []byte("wal-only"))
+		_ = e.Set(context.Background(), []byte("k2"), []byte("wal-only"))
 
 		// Abrupt exit: no Close() call. Crash simulation.
 		fmt.Println("step1 done: k1 synced, k2 in WAL only, crashed")
 
 	case "step2":
-		os.RemoveAll(dir)
-		os.MkdirAll(dir, 0755)
+		_ = os.RemoveAll(dir)
+		_ = os.MkdirAll(dir, 0750)
 
 		// Debug: show WALs before opening
 		wals, _ := store.List(context.Background(), ns+"/wal/")
@@ -73,7 +73,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		v, err := e.Get([]byte("k1"))
 		fmt.Printf("k1 = %q err=%v (should be from checkpoint)\n", v, err)

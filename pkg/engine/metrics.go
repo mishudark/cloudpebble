@@ -33,7 +33,7 @@ type Metrics struct {
 	BytesWrittenWAL atomic.Int64 // cumulative bytes written to WAL objects
 }
 
-// Snapshot returns a point-in-time snapshot of the metrics, suitable for
+// MetricsSnapshot is a point-in-time snapshot of the metrics, suitable for
 // reporting or serialization.
 type MetricsSnapshot struct {
 	Sets                int64

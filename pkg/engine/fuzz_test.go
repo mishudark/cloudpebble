@@ -80,11 +80,11 @@ func FuzzSetGetDelete(f *testing.F) {
 		if err != nil {
 			t.Skip(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		ctx := context.Background()
 
-		if err := e.Set(ctx, key, value); err != nil {
+		if err = e.Set(ctx, key, value); err != nil {
 			t.Skip(err)
 		}
 
@@ -96,7 +96,7 @@ func FuzzSetGetDelete(f *testing.F) {
 			t.Fatalf("got %q, want %q", got, value)
 		}
 
-		if err := e.Delete(ctx, key); err != nil {
+		if err = e.Delete(ctx, key); err != nil {
 			t.Fatalf("Delete failed: %v", err)
 		}
 
@@ -131,14 +131,14 @@ func FuzzMultipleOperations(f *testing.F) {
 		if err != nil {
 			t.Skip(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		ctx := context.Background()
 
-		if err := e.Set(ctx, k1, v1); err != nil {
+		if err = e.Set(ctx, k1, v1); err != nil {
 			t.Skip(err)
 		}
-		if err := e.Set(ctx, k2, v2); err != nil {
+		if err = e.Set(ctx, k2, v2); err != nil {
 			t.Skip(err)
 		}
 
@@ -158,7 +158,7 @@ func FuzzMultipleOperations(f *testing.F) {
 			t.Fatalf("k2: got %q, want %q", got2, v2)
 		}
 
-		if err := e.Set(ctx, k1, v2); err != nil {
+		if err = e.Set(ctx, k1, v2); err != nil {
 			t.Fatalf("overwrite failed: %v", err)
 		}
 		got1, err = e.Get(k1)
@@ -202,13 +202,13 @@ func FuzzNamespacePaths(f *testing.F) {
 		if err != nil {
 			t.Skip(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		ctx := context.Background()
 		key := []byte("test-key")
 		value := []byte("test-value")
 
-		if err := e.Set(ctx, key, value); err != nil {
+		if err = e.Set(ctx, key, value); err != nil {
 			t.Skip(err)
 		}
 
@@ -245,7 +245,7 @@ func FuzzMetricsSnapshot(f *testing.F) {
 		if err != nil {
 			t.Skip(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		ctx := context.Background()
 		_ = e.Set(ctx, key, value)

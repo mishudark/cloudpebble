@@ -46,8 +46,8 @@ func testPutGet(t *testing.T, s objstore.Store) {
 
 func testPutOverwrite(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
-	s.Put(ctx, "key", []byte("first"))
-	s.Put(ctx, "key", []byte("second"))
+	_ = s.Put(ctx, "key", []byte("first"))
+	_ = s.Put(ctx, "key", []byte("second"))
 	got, _ := s.Get(ctx, "key")
 	if string(got) != "second" {
 		t.Fatalf("got %q, want %q", got, "second")
@@ -66,8 +66,8 @@ func testGetNotFound(t *testing.T, s objstore.Store) {
 
 func testDelete(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
-	s.Put(ctx, "key", []byte("value"))
-	s.Delete(ctx, "key")
+	_ = s.Put(ctx, "key", []byte("value"))
+	_ = s.Delete(ctx, "key")
 	ok, err := s.Exists(ctx, "key")
 	if err != nil {
 		t.Fatal(err)
@@ -87,7 +87,7 @@ func testList(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
 	files := []string{"dir/a", "dir/b", "dir/c", "other"}
 	for _, f := range files {
-		s.Put(ctx, f, []byte(f))
+		_ = s.Put(ctx, f, []byte(f))
 	}
 	got, err := s.List(ctx, "dir/")
 	if err != nil {
@@ -102,7 +102,7 @@ func testListEmptyPrefix(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
 	files := []string{"a", "b", "c"}
 	for _, f := range files {
-		s.Put(ctx, f, []byte(f))
+		_ = s.Put(ctx, f, []byte(f))
 	}
 	got, err := s.List(ctx, "")
 	if err != nil {
@@ -116,7 +116,7 @@ func testListEmptyPrefix(t *testing.T, s objstore.Store) {
 
 func testExists(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
-	s.Put(ctx, "key", []byte("value"))
+	_ = s.Put(ctx, "key", []byte("value"))
 	ok, _ := s.Exists(ctx, "key")
 	if !ok {
 		t.Fatal("key should exist")
@@ -129,7 +129,7 @@ func testExists(t *testing.T, s objstore.Store) {
 
 func testAttrs(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
-	s.Put(ctx, "key", []byte("hello"))
+	_ = s.Put(ctx, "key", []byte("hello"))
 	info, err := s.Attrs(ctx, "key")
 	if err != nil {
 		t.Fatal(err)
@@ -154,7 +154,7 @@ func testAttrsNotFound(t *testing.T, s objstore.Store) {
 
 func testEmptyPayload(t *testing.T, s objstore.Store) {
 	ctx := context.Background()
-	s.Put(ctx, "empty", []byte{})
+	_ = s.Put(ctx, "empty", []byte{})
 	got, _ := s.Get(ctx, "empty")
 	if len(got) != 0 {
 		t.Fatalf("expected empty, got %v", got)
@@ -167,7 +167,7 @@ func testLargePayload(t *testing.T, s objstore.Store) {
 	for i := range payload {
 		payload[i] = byte(i % 256)
 	}
-	s.Put(ctx, "large", payload)
+	_ = s.Put(ctx, "large", payload)
 	got, _ := s.Get(ctx, "large")
 	if !bytes.Equal(payload, got) {
 		t.Fatal("large payload mismatch")

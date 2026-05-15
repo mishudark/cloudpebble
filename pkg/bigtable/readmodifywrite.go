@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"math"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -31,7 +32,7 @@ func (s *Server) ReadModifyWriteRow(ctx context.Context, req *bigtablepb.ReadMod
 
 	db := eng.DB()
 	batch := db.NewIndexedBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	ts := time.Now().UnixMicro()
 
@@ -58,9 +59,16 @@ func (s *Server) ReadModifyWriteRow(ctx context.Context, req *bigtablepb.ReadMod
 				if len(currentValue) != 8 {
 					return nil, status.Error(codes.FailedPrecondition, "existing cell value must be 8 bytes for increment")
 				}
-				currentInt = int64(binary.BigEndian.Uint64(currentValue))
+				uv := binary.BigEndian.Uint64(currentValue)
+				if uv > math.MaxInt64 {
+					return nil, status.Error(codes.FailedPrecondition, "existing cell value exceeds int64 range")
+				}
+				currentInt = int64(uv)
 			}
 			newInt := currentInt + r.IncrementAmount
+			if newInt < 0 {
+				return nil, status.Error(codes.OutOfRange, "increment result is negative")
+			}
 			newValue = make([]byte, 8)
 			binary.BigEndian.PutUint64(newValue, uint64(newInt))
 		default:
@@ -117,7 +125,7 @@ func readCellValue(batch *pebble.Batch, rowKey []byte, family string, qualifier 
 	if err != nil {
 		return nil
 	}
-	defer iter.Close()
+	defer func() { _ = iter.Close() }()
 
 	if iter.First() && iter.Valid() {
 		// Verify this key still belongs to the requested column.

@@ -11,6 +11,8 @@ import (
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
 )
 
+const benchTable = "projects/p/instances/i/tables/t"
+
 // sequentialKey returns a deterministic consecutive row key so benchmarks
 // measure true ingest (new keys), not overwrite.
 func sequentialKey(i int) []byte {
@@ -23,7 +25,7 @@ func sequentialKey(i int) []byte {
 func BenchmarkMutateRow(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	val := make([]byte, 64)
 	req := &bigtablepb.MutateRowRequest{
@@ -55,7 +57,7 @@ func BenchmarkMutateRow(b *testing.B) {
 func BenchmarkMutateRowMultiCell(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	mutations := make([]*bigtablepb.Mutation, 10)
 	for i := range mutations {
@@ -96,7 +98,7 @@ func BenchmarkMutateRows(b *testing.B) {
 
 func benchmarkMutateRows(b *testing.B, batchSize int) {
 	s := newTestServer(b)
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	mutation := &bigtablepb.Mutation{
 		Mutation: &bigtablepb.Mutation_SetCell_{
@@ -142,7 +144,7 @@ func benchmarkMutateRows(b *testing.B, batchSize int) {
 func BenchmarkReadModifyWriteRow(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	req := &bigtablepb.ReadModifyWriteRowRequest{
 		TableName: table,
@@ -170,7 +172,7 @@ func BenchmarkReadModifyWriteRow(b *testing.B) {
 // pre-populated table with 10k rows (1 cell each, 256B values).
 func BenchmarkReadRows(b *testing.B) {
 	s := newTestServer(b)
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	eng := openTableEngine(b, s, table)
 	db := eng.DB()
@@ -201,7 +203,7 @@ func BenchmarkReadRows(b *testing.B) {
 func BenchmarkSequentialWrites(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	start := time.Now()
 	b.ResetTimer()
@@ -236,7 +238,7 @@ func BenchmarkSequentialWrites(b *testing.B) {
 func BenchmarkParallelWrites(b *testing.B) {
 	s := newTestServer(b)
 	ctx := context.Background()
-	table := "projects/p/instances/i/tables/bench"
+	table := benchTable
 
 	var counter int64
 

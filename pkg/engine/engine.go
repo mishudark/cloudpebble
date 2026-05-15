@@ -1,3 +1,6 @@
+// Package engine implements a key-value storage engine that provides durable
+// writes via an object-storage-backed write-ahead log (WAL) and local Pebble
+// LSM for fast reads.
 package engine
 
 import (
@@ -5,12 +8,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,7 +91,7 @@ type Options struct {
 	// window are coalesced into a single GCS WAL object, amortizing GCS
 	// round-trips across many writers. Set to a negative value to disable
 	// batching (each write creates its own WAL object). Zero means use
-	// the default (1s).
+	// the default (200ms).
 	BatchWindow time.Duration
 
 	// MaxLocalBytes is the soft limit on the local Pebble cache size. When
@@ -121,6 +124,7 @@ type Engine struct {
 	mu        sync.Mutex
 	maxWALSeq uint64
 
+	syncMu       sync.Mutex
 	uploadedMu    sync.Mutex
 	uploadedFiles map[string]struct{}
 
@@ -129,6 +133,8 @@ type Engine struct {
 
 	maxLocalBytes   int64
 	manifestVersion int
+
+	pebbleOpts *pebble.Options
 
 	metrics Metrics
 
@@ -151,7 +157,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		opts.Dir = os.TempDir()
 	}
 	if opts.Store == nil {
-		return nil, fmt.Errorf("engine: objstore.Store is required")
+		return nil, errors.New("engine: objstore.Store is required")
 	}
 	if opts.Namespace == "" {
 		opts.Namespace = "default"
@@ -183,7 +189,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		return nil, fmt.Errorf("engine: creating WAL manager: %w", err)
 	}
 
-	if err := os.MkdirAll(opts.Dir, 0755); err != nil {
+	if err := os.MkdirAll(opts.Dir, 0750); err != nil {
 		return nil, fmt.Errorf("engine: creating local dir: %w", err)
 	}
 
@@ -197,6 +203,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		orphanWALTTL:   opts.OrphanWALTTL,
 		batchWindow:    opts.BatchWindow,
 		maxLocalBytes:  opts.MaxLocalBytes,
+		pebbleOpts:     opts.PebbleOptions,
 		uploadedFiles:  make(map[string]struct{}),
 		coldMissThresh: int64(opts.ColdMissThreshold),
 		errCh:          make(chan error, 16),
@@ -209,6 +216,8 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.ctx = ctx
 	e.cancel = cancel
+
+	e.walMgr.SetContext(ctx)
 
 	e.wg.Add(1)
 	go e.syncLoop(opts.SyncInterval)
@@ -237,7 +246,7 @@ func (e *Engine) recover(ctx context.Context) error {
 
 	if hasManifest {
 		var m Manifest
-		if err := json.Unmarshal(manifestBytes, &m); err != nil {
+		if err = json.Unmarshal(manifestBytes, &m); err != nil {
 			var old struct{ MaxWALSeq uint64 }
 			if err2 := json.Unmarshal(manifestBytes, &old); err2 != nil {
 				return fmt.Errorf("decoding manifest: %w", err)
@@ -248,18 +257,20 @@ func (e *Engine) recover(ctx context.Context) error {
 		e.manifestVersion = m.Version
 
 		dataPrefix := e.dataPrefix()
-		files, err := e.store.List(ctx, dataPrefix)
+		var files []string
+		files, err = e.store.List(ctx, dataPrefix)
 		if err != nil {
 			return fmt.Errorf("listing data files: %w", err)
 		}
 		for _, f := range files {
 			localName := filepath.Base(f)
 			localPath := filepath.Join(e.localDir, localName)
-			data, err := e.store.Get(ctx, f)
-			if err != nil {
-				return fmt.Errorf("downloading %s: %w", f, err)
-			}
-			if err := os.WriteFile(localPath, data, 0644); err != nil {
+		var data []byte
+		data, err = e.store.Get(ctx, f)
+		if err != nil {
+			return fmt.Errorf("downloading %s: %w", f, err)
+		}
+		if err = os.WriteFile(localPath, data, 0600); err != nil {
 				return fmt.Errorf("writing local %s: %w", localPath, err)
 			}
 			e.uploadedMu.Lock()
@@ -270,16 +281,14 @@ func (e *Engine) recover(ctx context.Context) error {
 		e.maxWALSeq = m.MaxWALSeq
 	}
 
-	db, err := pebble.Open(e.localDir, &pebble.Options{
-		DisableWAL: true,
-	})
+	db, err := pebble.Open(e.localDir, e.pebbleOpts)
 	if err != nil {
 		return fmt.Errorf("opening pebble: %w", err)
 	}
 
 	e.dbMu.Lock()
 	if e.db != nil {
-		e.db.Close()
+		_ = e.db.Close()
 	}
 	e.db = db
 	e.dbMu.Unlock()
@@ -308,14 +317,14 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 		}
 		batch := e.db.NewBatch()
 		if err := batch.SetRepr(data); err != nil {
-			batch.Close()
+			_ = batch.Close()
 			return fmt.Errorf("setting WAL repr seq %d: %w", entry.Seq, err)
 		}
 		if err := e.db.Apply(batch, pebble.NoSync); err != nil {
-			batch.Close()
+			_ = batch.Close()
 			return fmt.Errorf("replaying WAL seq %d: %w", entry.Seq, err)
 		}
-		batch.Close()
+		_ = batch.Close()
 
 		e.mu.Lock()
 		if entry.Seq > e.maxWALSeq {
@@ -365,15 +374,6 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 	e.metrics.WALObjectsWritten.Add(1)
 	e.metrics.BytesWrittenWAL.Add(int64(len(data)))
 
-	applyStart := time.Now()
-	e.dbMu.RLock()
-	err = e.db.Apply(batch, pebble.NoSync)
-	e.dbMu.RUnlock()
-	e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
-	if err != nil {
-		return 0, fmt.Errorf("engine: applying: %w", err)
-	}
-
 	if done != nil {
 		select {
 		case gcsErr := <-done:
@@ -383,6 +383,16 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
+	}
+
+	applyStart := time.Now()
+	e.dbMu.RLock()
+	err = e.db.Apply(batch, pebble.NoSync)
+	e.dbMu.RUnlock()
+	e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
+	if err != nil {
+		e.logger.Warn("local apply failed after durable WAL commit", "seq", seq, "error", err)
+		return 0, fmt.Errorf("engine: applying: %w", err)
 	}
 
 	e.mu.Lock()
@@ -397,7 +407,7 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 // storage before returning.
 func (e *Engine) Set(ctx context.Context, key, value []byte) error {
 	batch := e.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := batch.Set(key, value, nil); err != nil {
 		return fmt.Errorf("engine: building set: %w", err)
@@ -414,7 +424,7 @@ func (e *Engine) Set(ctx context.Context, key, value []byte) error {
 // before returning.
 func (e *Engine) Delete(ctx context.Context, key []byte) error {
 	batch := e.db.NewBatch()
-	defer batch.Close()
+	defer func() { _ = batch.Close() }()
 
 	if err := batch.Delete(key, nil); err != nil {
 		return fmt.Errorf("engine: building delete: %w", err)
@@ -446,6 +456,12 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	db := e.db
 	e.dbMu.RUnlock()
 
+	if e.recovering.Load() {
+		e.dbMu.RLock()
+		db = e.db
+		e.dbMu.RUnlock()
+	}
+
 	val, closer, err := db.Get(key)
 	if err != nil {
 		e.metrics.Gets.Add(1)
@@ -465,7 +481,7 @@ func (e *Engine) Get(key []byte) ([]byte, error) {
 	e.coldMissCount.Store(0)
 	result := make([]byte, len(val))
 	copy(result, val)
-	closer.Close()
+	_ = closer.Close()
 	return result, nil
 }
 
@@ -520,7 +536,7 @@ func (e *Engine) Metrics() *Metrics {
 // most recent background failure.
 func (e *Engine) Health() error {
 	if !e.healthy.Load() {
-		return fmt.Errorf("engine: unhealthy")
+		return errors.New("engine: unhealthy")
 	}
 	return nil
 }
@@ -547,6 +563,9 @@ func (e *Engine) Errors() <-chan error {
 // durably stored in object storage as both WAL entries and SST files.
 // Only new or changed SST files are uploaded (incremental).
 func (e *Engine) Sync(ctx context.Context) (err error) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+
 	start := time.Now()
 	defer func() {
 		e.metrics.SyncLatencyNs.Add(time.Since(start).Nanoseconds())
@@ -567,10 +586,10 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	<-flushDone
 
 	checkpointDir := filepath.Join(e.localDir, ckptDir)
-	os.RemoveAll(checkpointDir)
-	defer os.RemoveAll(checkpointDir)
+	_ = os.RemoveAll(checkpointDir)
+	defer func() { _ = os.RemoveAll(checkpointDir) }()
 
-	if err := db.Checkpoint(checkpointDir); err != nil {
+	if err = db.Checkpoint(checkpointDir); err != nil {
 		return fmt.Errorf("engine: checkpoint: %w", err)
 	}
 
@@ -584,26 +603,37 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	dataPrefix := e.dataPrefix()
 	e.mu.Unlock()
 
-	mutableNames := map[string]bool{
-		"MANIFEST":              true,
-		"OPTIONS":               true,
-		"marker.format-version": true,
-		"marker.manifest":       true,
-		"CURRENT":               true,
-	}
-
 	isMutable := func(name string) bool {
-		for prefix := range mutableNames {
-			if strings.HasPrefix(name, prefix) {
-				return true
-			}
+		switch name {
+		case "MANIFEST",
+			"OPTIONS",
+			"marker.format-version",
+			"marker.manifest",
+			"CURRENT":
+			return true
+		default:
+			return false
 		}
-		return false
 	}
 
 	checkpointFiles := make(map[string]bool, len(entries))
+	manifestFiles := make([]ManifestFile, 0, len(entries))
 	for _, entry := range entries {
 		checkpointFiles[entry.Name()] = true
+
+		localPath := filepath.Clean(filepath.Join(checkpointDir, entry.Name()))
+		var data []byte
+		data, err = os.ReadFile(localPath)
+		if err != nil {
+			return fmt.Errorf("engine: reading checkpoint file %s: %w", entry.Name(), err)
+		}
+
+		h := sha256.Sum256(data)
+		manifestFiles = append(manifestFiles, ManifestFile{
+			Name:     entry.Name(),
+			Size:     int64(len(data)),
+			Checksum: hex.EncodeToString(h[:]),
+		})
 
 		remotePath := filepath.ToSlash(filepath.Join(dataPrefix, entry.Name()))
 
@@ -615,12 +645,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 			continue
 		}
 
-		localPath := filepath.Join(checkpointDir, entry.Name())
-		data, err := os.ReadFile(localPath)
-		if err != nil {
-			return fmt.Errorf("engine: reading checkpoint file %s: %w", entry.Name(), err)
-		}
-		if err := e.store.Put(ctx, remotePath, data); err != nil {
+		if err = e.store.Put(ctx, remotePath, data); err != nil {
 			return fmt.Errorf("engine: uploading %s: %w", entry.Name(), err)
 		}
 
@@ -633,7 +658,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	for remotePath := range e.uploadedFiles {
 		base := filepath.Base(remotePath)
 		if !checkpointFiles[base] {
-			if err := e.store.Delete(ctx, remotePath); err != nil {
+			if err = e.store.Delete(ctx, remotePath); err != nil {
 				e.uploadedMu.Unlock()
 				return fmt.Errorf("engine: deleting stale file %s: %w", base, err)
 			}
@@ -647,19 +672,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		PrevVersion: e.manifestVersion,
 		MaxWALSeq:   currentSeq,
 		CreatedAt:   time.Now(),
-	}
-	for _, entry := range entries {
-		localPath := filepath.Join(checkpointDir, entry.Name())
-		data, err := os.ReadFile(localPath)
-		if err != nil {
-			return fmt.Errorf("engine: reading %s for checksum: %w", entry.Name(), err)
-		}
-		h := sha256.Sum256(data)
-		mf.Files = append(mf.Files, ManifestFile{
-			Name:     entry.Name(),
-			Size:     int64(len(data)),
-			Checksum: hex.EncodeToString(h[:]),
-		})
+		Files:        manifestFiles,
 	}
 	manifestBytes, err := json.Marshal(mf)
 	if err != nil {
@@ -669,11 +682,11 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	// Write versioned manifest first, then update the current manifest pointer.
 	// If the versioned write succeeds but the current pointer write fails,
 	// the versioned copy can be used for recovery.
-	if err := e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
+	if err = e.store.Put(ctx, e.manifestVersionPath(mf.Version), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing versioned manifest: %w", err)
 	}
 
-	if err := e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
+	if err = e.store.Put(ctx, e.manifestPath(), manifestBytes); err != nil {
 		return fmt.Errorf("engine: writing manifest: %w", err)
 	}
 
@@ -681,7 +694,7 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	if err == nil && len(oldVersions) > maxManifestHistory {
 		sort.Strings(oldVersions)
 		for _, v := range oldVersions[:len(oldVersions)-maxManifestHistory] {
-			e.store.Delete(ctx, v)
+			_ = e.store.Delete(ctx, v)
 		}
 	}
 
@@ -736,8 +749,8 @@ func (e *Engine) checkEviction() {
 		return
 	}
 
-	db.Compact(e.ctx, nil, nil, true)
-	e.Sync(e.ctx)
+	_ = db.Compact(e.ctx, nil, nil, true)
+	_ = e.Sync(e.ctx)
 }
 
 func (e *Engine) manifestPath() string {
@@ -762,10 +775,12 @@ func (e *Engine) Close() error {
 	e.cancel()
 	e.wg.Wait()
 
+	e.walMgr.Close()
+
 	if err := e.Sync(context.Background()); err != nil {
 		e.dbMu.RLock()
 		if e.db != nil {
-			e.db.Close()
+		_ = e.db.Close()
 		}
 		e.dbMu.RUnlock()
 		return fmt.Errorf("engine: final sync: %w", err)

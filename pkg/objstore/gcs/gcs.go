@@ -52,7 +52,7 @@ func (s *Store) unPrefix(fullPath string) string {
 func (s *Store) Put(ctx context.Context, path string, data []byte) error {
 	w := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewWriter(ctx)
 	if _, err := w.Write(data); err != nil {
-		w.Close()
+		_ = w.Close()
 		return fmt.Errorf("gcs: writing %s: %w", path, err)
 	}
 	if err := w.Close(); err != nil {
@@ -69,7 +69,7 @@ func (s *Store) Get(ctx context.Context, path string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("gcs: reading %s: %w", path, err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("gcs: reading body %s: %w", path, err)
@@ -132,9 +132,9 @@ func (s *Store) Close() error {
 
 func (s *Store) PutReader(ctx context.Context, path string, r io.Reader, size int64) error {
 	w := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewWriter(ctx)
-	w.ObjectAttrs.Size = size
+	w.Size = size
 	if _, err := io.Copy(w, r); err != nil {
-		w.Close()
+		_ = w.Close()
 		return fmt.Errorf("gcs: writing %s: %w", path, err)
 	}
 	if err := w.Close(); err != nil {

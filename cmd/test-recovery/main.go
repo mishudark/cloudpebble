@@ -23,9 +23,9 @@ func main() {
 
 	switch os.Args[1] {
 	case "step1":
-		os.RemoveAll(dir)
-		os.RemoveAll(objDir)
-		os.MkdirAll(dir, 0755)
+		_ = os.RemoveAll(dir)
+		_ = os.RemoveAll(objDir)
+		_ = os.MkdirAll(dir, 0750)
 
 		store, err := local.New(objDir)
 		if err != nil {
@@ -63,8 +63,8 @@ func main() {
 
 	case "step2":
 		// Delete local data to simulate node restart / cold recovery
-		os.RemoveAll(dir)
-		os.MkdirAll(dir, 0755)
+		_ = os.RemoveAll(dir)
+		_ = os.MkdirAll(dir, 0750)
 
 		store, err := local.New(objDir)
 		if err != nil {
@@ -79,7 +79,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer e.Close()
+		defer func() { _ = e.Close() }()
 
 		for _, k := range []string{"k1", "k2", "k3"} {
 			v, err := e.Get([]byte(k))

@@ -271,6 +271,7 @@ func FuzzInterleaveFilterDedup(f *testing.F) {
 		if len(fam3) > 64 {
 			fam3 = fam3[:64]
 		}
+		_ = fam3
 		if fam1 == "" {
 			fam1 = "f1"
 		}

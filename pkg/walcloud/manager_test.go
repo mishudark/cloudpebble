@@ -2,7 +2,7 @@ package walcloud_test
 
 import (
 	"context"
-	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -65,7 +65,7 @@ func TestSequenceNumbersMonotonic(t *testing.T) {
 
 	var prev uint64
 	for i := 0; i < 10; i++ {
-		seq, _, err := mgr.WriteRecord(ctx, []byte(fmt.Sprintf("%d", i)))
+		seq, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,7 +84,9 @@ func TestListOrdered(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
-		mgr.WriteRecord(ctx, []byte(fmt.Sprintf("%d", i)))
+		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	entries, err := mgr.List(ctx)
@@ -106,7 +108,9 @@ func TestGC(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 5; i++ {
-		mgr.WriteRecord(ctx, []byte(fmt.Sprintf("%d", i)))
+		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// GC up to seq 3
@@ -135,7 +139,9 @@ func TestGC_OrphanTTL(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		mgr.WriteRecord(ctx, []byte(fmt.Sprintf("%d", i)))
+		if _, _, err := mgr.WriteRecord(ctx, []byte(strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Small delay so created-at times are in the past.
@@ -168,7 +174,9 @@ func TestRecoveryFromExisting(t *testing.T) {
 	mgr1, _ := walcloud.NewManager(store, "ns", 0)
 	ctx := context.Background()
 	for i := 0; i < 3; i++ {
-		mgr1.WriteRecord(ctx, []byte("x"))
+		if _, _, writeErr := mgr1.WriteRecord(ctx, []byte("x")); writeErr != nil {
+			t.Fatal(writeErr)
+		}
 	}
 
 	// Create second manager (same store); nextSeq should be 4.
@@ -264,7 +272,9 @@ func TestNextSeq(t *testing.T) {
 	if mgr.NextSeq() != 1 {
 		t.Fatalf("initial NextSeq = %d, want 1", mgr.NextSeq())
 	}
-	mgr.WriteRecord(context.Background(), []byte("x"))
+	if _, _, err := mgr.WriteRecord(context.Background(), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 	if mgr.NextSeq() != 2 {
 		t.Fatalf("NextSeq after write = %d, want 2", mgr.NextSeq())
 	}

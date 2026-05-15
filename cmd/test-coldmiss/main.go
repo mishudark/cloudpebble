@@ -18,8 +18,8 @@ func main() {
 	objDir := filepath.Join(os.TempDir(), "cloudpebble-test-coldmiss-obj")
 	namespace := "test-coldmiss"
 
-	os.RemoveAll(dir)
-	os.RemoveAll(objDir)
+	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(objDir)
 
 	store, err := local.New(objDir)
 	if err != nil {
@@ -37,8 +37,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	e.Set(context.Background(), []byte("foo"), []byte("bar"))
-	e.Sync(context.Background()) // upload to GCS
+	_ = e.Set(context.Background(), []byte("foo"), []byte("bar"))
+	_ = e.Sync(context.Background()) // upload to GCS
 
 	// Verify normal read works
 	v, err := e.Get([]byte("foo"))
@@ -51,7 +51,7 @@ func main() {
 	localFiles, _ := os.ReadDir(dir)
 	for _, f := range localFiles {
 		if f.Name() != "LOCK" {
-			os.Remove(filepath.Join(dir, f.Name()))
+			_ = os.Remove(filepath.Join(dir, f.Name()))
 		}
 	}
 	fmt.Printf("Deleted %d local files (simulating cold node)\n", len(localFiles)-1)
@@ -76,5 +76,5 @@ func main() {
 		fmt.Println("PASS: cold-miss recovery")
 	}
 
-	e.Close()
+	_ = e.Close()
 }
