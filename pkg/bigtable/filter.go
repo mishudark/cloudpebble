@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/cockroachdb/pebble"
@@ -214,11 +215,11 @@ func (il *interleaveFilter) reset() {
 // --- Condition ---
 
 type conditionFilter struct {
-	predicate  filterEvaluator
+	predicate   filterEvaluator
 	trueFilter  filterEvaluator
 	falseFilter filterEvaluator
-	matched    bool
-	evaluated  bool
+	matched     bool
+	evaluated   bool
 }
 
 func buildCondition(cond *bigtablepb.RowFilter_Condition) (*conditionFilter, error) {
@@ -311,12 +312,12 @@ func (r *qualifierRegexFilter) reset()                      {}
 // --- Column Range Filter ---
 
 type columnRangeFilter struct {
-	family              string
-	startQualifier      []byte
-	endQualifier        []byte
-	startInclusive      bool
-	endInclusive        bool
-	rangeSet            bool
+	family         string
+	startQualifier []byte
+	endQualifier   []byte
+	startInclusive bool
+	endInclusive   bool
+	rangeSet       bool
 }
 
 func buildColumnRangeFilter(cr *bigtablepb.ColumnRange) *columnRangeFilter {
@@ -434,7 +435,7 @@ func (c *cellsPerRowLimitFilter) evaluate(cell cellInfo) bool {
 func (c *cellsPerRowLimitFilter) reset() { c.rowCount = 0 }
 
 type cellsPerColumnLimitFilter struct {
-	limit    int
+	limit     int
 	colCounts map[string]int
 }
 
@@ -486,8 +487,8 @@ func (v *valueRegexFilter) reset() {}
 // --- Value Range Filter ---
 
 type valueRangeFilter struct {
-	startValue    []byte
-	endValue      []byte
+	startValue     []byte
+	endValue       []byte
 	startInclusive bool
 	endInclusive   bool
 }
@@ -634,16 +635,12 @@ func evaluatorHasStripValue(e filterEvaluator) bool {
 	case *stripValueFilter:
 		return true
 	case *chainFilter:
-		for _, sub := range f.filters {
-			if evaluatorHasStripValue(sub) {
-				return true
-			}
+		if slices.ContainsFunc(f.filters, evaluatorHasStripValue) {
+			return true
 		}
 	case *interleaveFilter:
-		for _, sub := range f.filters {
-			if evaluatorHasStripValue(sub) {
-				return true
-			}
+		if slices.ContainsFunc(f.filters, evaluatorHasStripValue) {
+			return true
 		}
 	case *conditionFilter:
 		if f.predicate != nil && evaluatorHasStripValue(f.predicate) {

@@ -284,7 +284,7 @@ func TestEncodeRowPrefix(t *testing.T) {
 		t.Fatalf("prefix length: got %d, want %d", len(rp), len("hello")+2)
 	}
 	// Row key bytes should match input.
-	for i := 0; i < len("hello"); i++ {
+	for i := range len("hello") {
 		if rp[i] != "hello"[i] {
 			t.Fatalf("row key byte %d: got %02x, want %02x", i, rp[i], "hello"[i])
 		}

@@ -25,7 +25,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -127,7 +127,7 @@ func phaseWrite(bucket, prefix string) {
 	deadline := time.Now().Add(runDuration)
 	done := make(chan struct{})
 
-	for i := 0; i < concurrency; i++ {
+	for i := range concurrency {
 		go func(id int) {
 			var localSeq int64
 			for {
@@ -189,9 +189,7 @@ func phaseWrite(bucket, prefix string) {
 	fmt.Printf("Throughput:    %.0f ops/s\n", ops)
 
 	if len(latencies) > 0 {
-		sort.Slice(latencies, func(i, j int) bool {
-			return latencies[i] < latencies[j]
-		})
+		slices.Sort(latencies)
 		p50 := latencies[len(latencies)*50/100]
 		p95 := latencies[len(latencies)*95/100]
 		p99 := latencies[len(latencies)*99/100]
@@ -219,7 +217,7 @@ func phaseWrite(bucket, prefix string) {
 	nPostSync := 5
 	fmt.Printf("Writing %d keys post-sync (WAL-only)...\n", nPostSync)
 	postCtx, postCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	for i := 0; i < nPostSync; i++ {
+	for i := range nPostSync {
 		key := fmt.Sprintf("post-sync-key-%d", i)
 		if err := e.Set(postCtx, []byte(key), []byte("wal-only")); err != nil {
 			log.Fatalf("post-sync Set: %v", err)
@@ -234,12 +232,12 @@ func phaseWrite(bucket, prefix string) {
 	defer syncCancel2()
 
 	var sampled []string
-	for gid := 0; gid < concurrency; gid++ {
+	for gid := range concurrency {
 		for j := int64(1); j <= 5; j++ {
 			sampled = append(sampled, fmt.Sprintf("goroutine-%d-key-%d", gid, j))
 		}
 	}
-	for i := 0; i < nPostSync; i++ {
+	for i := range nPostSync {
 		sampled = append(sampled, fmt.Sprintf("post-sync-key-%d", i))
 	}
 	sampledBytes := []byte(strings.Join(sampled, "\n"))
@@ -376,7 +374,7 @@ func phaseRecover(bucket, prefix string) {
 	deadline := time.Now().Add(phase3Duration)
 	postDone := make(chan struct{})
 
-	for i := 0; i < concurrency/10; i++ {
+	for i := range concurrency / 10 {
 		go func(id int) {
 			var localSeq int64
 			for {
@@ -435,7 +433,7 @@ func phaseRecover(bucket, prefix string) {
 
 	// Verify a handful of the post-recovery keys.
 	var postVerified, postMissing int
-	for gid := 0; gid < concurrency/10; gid++ {
+	for gid := range concurrency / 10 {
 		key := fmt.Sprintf("recover-goroutine-%d-key-%d", gid, int64(1))
 		_, err = e.Get([]byte(key))
 		if err != nil {

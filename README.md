@@ -208,7 +208,7 @@ Eventual consistency converges to strong over time as the background WAL replay 
 
 ## Bigtable API (gRPC)
 
-CloudPebble includes a [Google Cloud Bigtable v2](https://cloud.google.com/bigtable/docs/reference/data-plane/rpc) compatible gRPC server that maps Bigtable's wide-column data model onto Pebble's key-value store. Each Bigtable table is backed by a separate CloudPebble namespace with its own Pebble DB + object storage durability.
+CloudPebble includes a [Google Cloud Bigtable v2](https://docs.cloud.google.com/bigtable/docs/reference/data/rpc/google.bigtable.v2) compatible gRPC server that maps Bigtable's wide-column data model onto Pebble's key-value store. Each Bigtable table is backed by a separate CloudPebble namespace with its own Pebble DB + object storage durability.
 
 The implementation follows the same key-encoding approach described in [Pinterest's Rockstorewidecolumn](https://medium.com/pinterest-engineering/building-pinterests-new-wide-column-database-using-rocksdb-f5277ee4e3d2).
 

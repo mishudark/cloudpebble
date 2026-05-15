@@ -53,7 +53,7 @@ type Manager struct {
 	nextSeq uint64
 
 	// Batching state. Protected by mu.
-	pending     [][]byte     // batch repr segments for current window
+	pending     [][]byte // batch repr segments for current window
 	pendingSeq  uint64
 	waiters     []chan error // callers waiting for this batch to commit
 	commitTimer *time.Timer
@@ -221,9 +221,7 @@ func (m *Manager) flushPending() {
 	data := mergeBatchSegments(segments)
 	p := m.walPath(seq)
 
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
+	m.wg.Go(func() {
 		var gcsErr error
 		ctx := m.ctx
 		if ctx == nil {
@@ -235,7 +233,7 @@ func (m *Manager) flushPending() {
 		for _, ch := range waiters {
 			ch <- gcsErr
 		}
-	}()
+	})
 }
 
 // batchHeaderLen is the Pebble batch repr header size (seqnum + count).
