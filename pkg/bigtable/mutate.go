@@ -10,6 +10,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // MutateRow applies a set of mutations to a single row atomically.
@@ -73,7 +74,12 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 	}
 
 	if len(entryErrors) > 0 {
-		resp := &bigtablepb.MutateRowsResponse{}
+		resp := &bigtablepb.MutateRowsResponse{
+			RateLimitInfo: &bigtablepb.RateLimitInfo{
+				Period: &durationpb.Duration{Seconds: 1},
+				Factor: 1.0,
+			},
+		}
 		errSet := make(map[int64]bool)
 		for _, e := range entryErrors {
 			errSet[e.index] = true
@@ -95,7 +101,12 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 
 	err = eng.Apply(stream.Context(), batch)
 	if err != nil {
-		resp := &bigtablepb.MutateRowsResponse{}
+		resp := &bigtablepb.MutateRowsResponse{
+			RateLimitInfo: &bigtablepb.RateLimitInfo{
+				Period: &durationpb.Duration{Seconds: 1},
+				Factor: 1.0,
+			},
+		}
 		for i := range entries {
 			resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
 				Index:  int64(i),
@@ -105,7 +116,12 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 		return stream.Send(resp)
 	}
 
-	resp := &bigtablepb.MutateRowsResponse{}
+	resp := &bigtablepb.MutateRowsResponse{
+		RateLimitInfo: &bigtablepb.RateLimitInfo{
+			Period: &durationpb.Duration{Seconds: 1},
+			Factor: 1.0,
+		},
+	}
 	for i := range entries {
 		resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
 			Index:  int64(i),

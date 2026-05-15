@@ -1,6 +1,8 @@
 package bigtable
 
 import (
+	"bytes"
+	"math/rand"
 	"regexp"
 	"strings"
 
@@ -104,6 +106,22 @@ func buildEvaluator(filter *bigtablepb.RowFilter) (filterEvaluator, error) {
 
 	case *bigtablepb.RowFilter_ApplyLabelTransformer:
 		return &applyLabelFilter{label: f.ApplyLabelTransformer}, nil
+
+	case *bigtablepb.RowFilter_ValueRegexFilter:
+		re, err := regexp.Compile(string(f.ValueRegexFilter))
+		if err != nil {
+			return nil, err
+		}
+		return &valueRegexFilter{re: re}, nil
+
+	case *bigtablepb.RowFilter_ValueRangeFilter:
+		return buildValueRangeFilter(f.ValueRangeFilter), nil
+
+	case *bigtablepb.RowFilter_ValueBitmaskFilter:
+		return &valueBitmaskFilter{mask: f.ValueBitmaskFilter.GetMask()}, nil
+
+	case *bigtablepb.RowFilter_RowSampleFilter:
+		return &rowSampleFilter{rate: f.RowSampleFilter}, nil
 
 	default:
 		// Unsupported filters pass everything.
@@ -453,6 +471,118 @@ func (a *applyLabelFilter) evaluate(cell cellInfo) bool {
 	return true
 }
 func (a *applyLabelFilter) reset() {}
+
+// --- Value Regex Filter ---
+
+type valueRegexFilter struct {
+	re *regexp.Regexp
+}
+
+func (v *valueRegexFilter) evaluate(cell cellInfo) bool {
+	return v.re.Match(cell.value)
+}
+func (v *valueRegexFilter) reset() {}
+
+// --- Value Range Filter ---
+
+type valueRangeFilter struct {
+	startValue    []byte
+	endValue      []byte
+	startInclusive bool
+	endInclusive   bool
+}
+
+func buildValueRangeFilter(vr *bigtablepb.ValueRange) *valueRangeFilter {
+	f := &valueRangeFilter{}
+	switch s := vr.StartValue.(type) {
+	case *bigtablepb.ValueRange_StartValueClosed:
+		f.startValue = s.StartValueClosed
+		f.startInclusive = true
+	case *bigtablepb.ValueRange_StartValueOpen:
+		f.startValue = s.StartValueOpen
+	}
+	switch e := vr.EndValue.(type) {
+	case *bigtablepb.ValueRange_EndValueClosed:
+		f.endValue = e.EndValueClosed
+		f.endInclusive = true
+	case *bigtablepb.ValueRange_EndValueOpen:
+		f.endValue = e.EndValueOpen
+	}
+	return f
+}
+
+func (v *valueRangeFilter) evaluate(cell cellInfo) bool {
+	if len(v.startValue) > 0 {
+		cmp := strings.Compare(string(cell.value), string(v.startValue))
+		if v.startInclusive {
+			if cmp < 0 {
+				return false
+			}
+		} else {
+			if cmp <= 0 {
+				return false
+			}
+		}
+	}
+	if len(v.endValue) > 0 {
+		cmp := strings.Compare(string(cell.value), string(v.endValue))
+		if v.endInclusive {
+			if cmp > 0 {
+				return false
+			}
+		} else {
+			if cmp >= 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+func (v *valueRangeFilter) reset() {}
+
+// --- Value Bitmask Filter ---
+
+type valueBitmaskFilter struct {
+	mask []byte
+}
+
+func (v *valueBitmaskFilter) evaluate(cell cellInfo) bool {
+	if len(cell.value) < len(v.mask) {
+		return false
+	}
+	for i := 0; i < len(v.mask); i++ {
+		if (cell.value[i] & v.mask[i]) != v.mask[i] {
+			return false
+		}
+	}
+	// Remaining bytes (beyond mask length) must be zero.
+	for i := len(v.mask); i < len(cell.value); i++ {
+		if cell.value[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+func (v *valueBitmaskFilter) reset() {}
+
+// --- Row Sample Filter ---
+
+type rowSampleFilter struct {
+	rate      float64
+	seenRow   []byte
+	sampleRow bool
+}
+
+func (r *rowSampleFilter) evaluate(cell cellInfo) bool {
+	if !bytes.Equal(cell.rowKey, r.seenRow) {
+		r.seenRow = append(r.seenRow[:0], cell.rowKey...)
+		r.sampleRow = rand.Float64() < r.rate
+	}
+	return r.sampleRow
+}
+func (r *rowSampleFilter) reset() {
+	r.seenRow = r.seenRow[:0]
+}
 
 // --- Filter engine methods ---
 

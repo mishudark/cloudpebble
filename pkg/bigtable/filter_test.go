@@ -1020,6 +1020,196 @@ func TestBuildTimestampRangeFilterDefaults(t *testing.T) {
 	}
 }
 
+func TestValueRegexFilter(t *testing.T) {
+	f := &valueRegexFilter{re: regexp.MustCompile("^hello")}
+	if !f.evaluate(cellInfo{value: []byte("hello world")}) {
+		t.Fatal("should match 'hello world'")
+	}
+	if f.evaluate(cellInfo{value: []byte("world hello")}) {
+		t.Fatal("should not match 'world hello'")
+	}
+}
+
+func TestBuildEvaluatorValueRegex(t *testing.T) {
+	f := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_ValueRegexFilter{
+			ValueRegexFilter: []byte("^v[12]$"),
+		},
+	}
+	e, err := buildEvaluator(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !e.evaluate(cellInfo{value: []byte("v1")}) {
+		t.Fatal("should match v1")
+	}
+	if e.evaluate(cellInfo{value: []byte("v3")}) {
+		t.Fatal("should not match v3")
+	}
+}
+
+func TestBuildEvaluatorValueRegexInvalid(t *testing.T) {
+	f := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_ValueRegexFilter{
+			ValueRegexFilter: []byte("[invalid"),
+		},
+	}
+	_, err := buildEvaluator(f)
+	if err == nil {
+		t.Fatal("expected error for invalid regex")
+	}
+}
+
+func TestValueRangeFilter(t *testing.T) {
+	f := &valueRangeFilter{startValue: []byte("b"), startInclusive: true, endValue: []byte("d"), endInclusive: false}
+	if f.evaluate(cellInfo{value: []byte("a")}) {
+		t.Fatal("should exclude 'a' (before start)")
+	}
+	if !f.evaluate(cellInfo{value: []byte("b")}) {
+		t.Fatal("should include 'b' (closed start)")
+	}
+	if !f.evaluate(cellInfo{value: []byte("c")}) {
+		t.Fatal("should include 'c' (within range)")
+	}
+	if f.evaluate(cellInfo{value: []byte("d")}) {
+		t.Fatal("should exclude 'd' (open end)")
+	}
+	if f.evaluate(cellInfo{value: []byte("e")}) {
+		t.Fatal("should exclude 'e' (after end)")
+	}
+}
+
+func TestBuildEvaluatorValueRange(t *testing.T) {
+	f := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_ValueRangeFilter{
+			ValueRangeFilter: &bigtablepb.ValueRange{
+				StartValue: &bigtablepb.ValueRange_StartValueClosed{
+					StartValueClosed: []byte("v2"),
+				},
+				EndValue: &bigtablepb.ValueRange_EndValueOpen{
+					EndValueOpen: []byte("v4"),
+				},
+			},
+		},
+	}
+	e, err := buildEvaluator(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !e.evaluate(cellInfo{value: []byte("v2")}) {
+		t.Fatal("should include v2 (closed start)")
+	}
+	if !e.evaluate(cellInfo{value: []byte("v3")}) {
+		t.Fatal("should include v3")
+	}
+	if e.evaluate(cellInfo{value: []byte("v4")}) {
+		t.Fatal("should exclude v4 (open end)")
+	}
+}
+
+func TestValueBitmaskFilter(t *testing.T) {
+	f := &valueBitmaskFilter{mask: []byte{0x0F}}
+	if !f.evaluate(cellInfo{value: []byte{0x1F}}) {
+		t.Fatal("0x1F & 0x0F == 0x0F, should match")
+	}
+	if f.evaluate(cellInfo{value: []byte{0xF0}}) {
+		t.Fatal("0xF0 & 0x0F == 0x00 != 0x0F, should not match")
+	}
+	if f.evaluate(cellInfo{value: []byte{0x0F, 0x01}}) {
+		t.Fatal("remaining bytes must be zero, should not match")
+	}
+	if f.evaluate(cellInfo{value: []byte{0x01}}) {
+		t.Fatal("value shorter than mask should not match")
+	}
+}
+
+func TestBuildEvaluatorValueBitmask(t *testing.T) {
+	f := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_ValueBitmaskFilter{
+			ValueBitmaskFilter: &bigtablepb.ValueBitmask{
+				Mask: []byte{0xFF, 0x00},
+			},
+		},
+	}
+	e, err := buildEvaluator(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if e.evaluate(cellInfo{value: []byte{0x01, 0x00}}) {
+		t.Fatal("0x01 & 0xFF != 0xFF, should not match")
+	}
+	if !e.evaluate(cellInfo{value: []byte{0xFF, 0x00}}) {
+		t.Fatal("0xFF & 0xFF == 0xFF and trailing ok, should match")
+	}
+}
+
+func TestRowSampleFilter(t *testing.T) {
+	f := &rowSampleFilter{rate: 1.0}
+	if !f.evaluate(cellInfo{rowKey: []byte("row1")}) {
+		t.Fatal("rate=1.0 should always sample")
+	}
+	f2 := &rowSampleFilter{rate: 0.0}
+	if f2.evaluate(cellInfo{rowKey: []byte("row1")}) {
+		t.Fatal("rate=0.0 should never sample")
+	}
+}
+
+func TestBuildEvaluatorRowSample(t *testing.T) {
+	f := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_RowSampleFilter{
+			RowSampleFilter: 0.5,
+		},
+	}
+	e, err := buildEvaluator(f)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Can't assert exact behavior of random sampling, just check it doesn't panic.
+	_ = e.evaluate(cellInfo{rowKey: []byte("row1")})
+	e.reset()
+}
+
+func TestValueRegexFilterViaReadRows(t *testing.T) {
+	s := newTestServer(t)
+	table := "projects/p/instances/i/tables/t"
+	populateTable(t, s, table)
+
+	req := &bigtablepb.ReadRowsRequest{
+		TableName: table,
+		Filter: &bigtablepb.RowFilter{
+			Filter: &bigtablepb.RowFilter_ValueRegexFilter{
+				ValueRegexFilter: []byte("^v[12]$"),
+			},
+		},
+	}
+	stream := newMockServerStream[*bigtablepb.ReadRowsResponse]()
+	err := s.ReadRows(req, stream)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var allChunks []*bigtablepb.ReadRowsResponse_CellChunk
+	for _, resp := range stream.sent {
+		allChunks = append(allChunks, resp.Chunks...)
+	}
+
+	// Should find v1 and v2 (match ^v[12]$), no v3/v4/v5.
+	valueCount := 0
+	for _, c := range allChunks {
+		if c.GetCommitRow() {
+			continue
+		}
+		valueCount++
+		v := string(c.Value)
+		if v != "v1" && v != "v2" {
+			t.Fatalf("unexpected value %q", v)
+		}
+	}
+	if valueCount != 2 {
+		t.Fatalf("expected 2 matching cells, got %d", valueCount)
+	}
+}
+
 func TestCellsPerColumnLimitFilterReset(t *testing.T) {
 	f := &cellsPerColumnLimitFilter{limit: 1}
 	f.evaluate(cellInfo{family: "cf", qualifier: []byte("q"), ts: 1})

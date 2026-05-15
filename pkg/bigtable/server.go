@@ -119,7 +119,14 @@ func (s *Server) db(ctx context.Context, tableName string) (*pebble.DB, error) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) GetClientConfiguration(ctx context.Context, req *bigtablepb.GetClientConfigurationRequest) (*bigtablepb.ClientConfiguration, error) {
-	return &bigtablepb.ClientConfiguration{}, nil
+	return &bigtablepb.ClientConfiguration{
+		SessionConfiguration: &bigtablepb.SessionClientConfiguration{
+			SessionLoad: 1.0, // 100% of requests should use sessions
+		},
+		Polling: &bigtablepb.ClientConfiguration_StopPolling{
+			StopPolling: true, // no need to poll for config changes
+		},
+	}, nil
 }
 
 // ---------------------------------------------------------------------------

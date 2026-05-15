@@ -528,6 +528,68 @@ func TestCommitRowChunk(t *testing.T) {
 	}
 }
 
+func TestAppendCellChunksSmallValue(t *testing.T) {
+	buf := appendCellChunks(nil, []byte("row1"), "cf", []byte("q"), 100, []byte("small"))
+	if len(buf) != 1 {
+		t.Fatalf("expected 1 chunk for small value, got %d", len(buf))
+	}
+	if string(buf[0].Value) != "small" {
+		t.Fatalf("value mismatch: got %q", buf[0].Value)
+	}
+	if buf[0].ValueSize != 0 {
+		t.Fatal("value_size should be 0 for single-chunk values")
+	}
+}
+
+func TestAppendCellChunksLargeValue(t *testing.T) {
+	largeVal := make([]byte, maxCellChunkValueSize+1)
+	for i := range largeVal {
+		largeVal[i] = byte(i)
+	}
+	buf := appendCellChunks(nil, []byte("row1"), "cf", []byte("q"), 100, largeVal)
+	if len(buf) != 2 {
+		t.Fatalf("expected 2 chunks for %d-byte value, got %d", len(largeVal), len(buf))
+	}
+	// First chunk should have value_size hint set to total length.
+	if buf[0].ValueSize != int32(len(largeVal)) {
+		t.Fatalf("expected value_size=%d on first chunk, got %d", len(largeVal), buf[0].ValueSize)
+	}
+	if len(buf[0].Value) != maxCellChunkValueSize {
+		t.Fatalf("first chunk should be %d bytes, got %d", maxCellChunkValueSize, len(buf[0].Value))
+	}
+	if buf[1].ValueSize != 0 {
+		t.Fatal("last chunk should not have value_size set")
+	}
+	if len(buf[1].Value) != 1 {
+		t.Fatalf("last chunk should be 1 byte, got %d", len(buf[1].Value))
+	}
+	// Verify value reconstruction.
+	reconstructed := append([]byte(nil), buf[0].Value...)
+	reconstructed = append(reconstructed, buf[1].Value...)
+	if !bytes.Equal(reconstructed, largeVal) {
+		t.Fatal("reconstructed value should match original")
+	}
+}
+
+func TestResetRowChunk(t *testing.T) {
+	chunk := resetRowChunk()
+	if !chunk.GetResetRow() {
+		t.Fatal("expected ResetRow to be true")
+	}
+}
+
+func TestRowTerminal(t *testing.T) {
+	if !rowTerminal(commitRowChunk()) {
+		t.Fatal("commitRowChunk should be terminal")
+	}
+	if !rowTerminal(resetRowChunk()) {
+		t.Fatal("resetRowChunk should be terminal")
+	}
+	if rowTerminal(&bigtablepb.ReadRowsResponse_CellChunk{Value: []byte("data")}) {
+		t.Fatal("data chunk should not be terminal")
+	}
+}
+
 func TestRowRangeToBounds(t *testing.T) {
 	t.Run("start closed end open", func(t *testing.T) {
 		rr := &bigtablepb.RowRange{
@@ -600,6 +662,90 @@ func TestReadRowsInvalidFilter(t *testing.T) {
 	}
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected InvalidArgument, got %v", status.Code(err))
+	}
+}
+
+func TestReadRowsReversed(t *testing.T) {
+	s := newTestServer(t)
+	table := "projects/p/instances/i/tables/t"
+	populateTable(t, s, table)
+
+	req := &bigtablepb.ReadRowsRequest{
+		TableName: table,
+		Reversed:  true,
+	}
+
+	stream := newMockServerStream[*bigtablepb.ReadRowsResponse]()
+	err := s.ReadRows(req, stream)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var allChunks []*bigtablepb.ReadRowsResponse_CellChunk
+	for _, resp := range stream.sent {
+		allChunks = append(allChunks, resp.Chunks...)
+	}
+
+	// Build ordered unique row keys from chunks (RowKey set on first cell of each row).
+	seen := make(map[string]bool)
+	var rowKeysInOrder [][]byte
+	for _, c := range allChunks {
+		key := string(c.RowKey)
+		if len(c.RowKey) > 0 && !seen[key] {
+			seen[key] = true
+			rowKeysInOrder = append(rowKeysInOrder, c.RowKey)
+		}
+	}
+
+	// Expect 3 rows in reverse order: row3, row2, row1.
+	if len(rowKeysInOrder) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rowKeysInOrder))
+	}
+	if string(rowKeysInOrder[0]) != "row3" {
+		t.Fatalf("expected first row to be row3 (reversed), got %q", rowKeysInOrder[0])
+	}
+	if string(rowKeysInOrder[1]) != "row2" {
+		t.Fatalf("expected second row to be row2, got %q", rowKeysInOrder[1])
+	}
+	if string(rowKeysInOrder[2]) != "row1" {
+		t.Fatalf("expected third row to be row1, got %q", rowKeysInOrder[2])
+	}
+}
+
+func TestReadRowsReversedWithLimit(t *testing.T) {
+	s := newTestServer(t)
+	table := "projects/p/instances/i/tables/t"
+	populateTable(t, s, table)
+
+	req := &bigtablepb.ReadRowsRequest{
+		TableName: table,
+		Reversed:  true,
+		RowsLimit: 1,
+	}
+
+	stream := newMockServerStream[*bigtablepb.ReadRowsResponse]()
+	err := s.ReadRows(req, stream)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var allChunks []*bigtablepb.ReadRowsResponse_CellChunk
+	for _, resp := range stream.sent {
+		allChunks = append(allChunks, resp.Chunks...)
+	}
+
+	seen := make(map[string]bool)
+	var rowKeysInOrder [][]byte
+	for _, c := range allChunks {
+		key := string(c.RowKey)
+		if len(c.RowKey) > 0 && !seen[key] {
+			seen[key] = true
+			rowKeysInOrder = append(rowKeysInOrder, c.RowKey)
+		}
+	}
+
+	if len(rowKeysInOrder) != 1 || string(rowKeysInOrder[0]) != "row3" {
+		t.Fatalf("expected only row3 (last row, reversed with limit 1), got %v", rowKeysInOrder)
 	}
 }
 
