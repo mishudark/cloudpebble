@@ -30,6 +30,8 @@ type Metrics struct {
 	SyncCalls    atomic.Int64
 	SyncFailures atomic.Int64
 
+	AsyncWALFailures atomic.Int64
+
 	BytesWrittenWAL atomic.Int64 // cumulative bytes written to WAL objects
 }
 
@@ -50,6 +52,7 @@ type MetricsSnapshot struct {
 	OrphanWALsGCd       int64
 	SyncCalls           int64
 	SyncFailures        int64
+	AsyncWALFailures    int64
 	BytesWrittenWAL     int64
 }
 
@@ -66,6 +69,7 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 		OrphanWALsGCd:     m.OrphanWALsGCd.Load(),
 		SyncCalls:         m.SyncCalls.Load(),
 		SyncFailures:      m.SyncFailures.Load(),
+		AsyncWALFailures:  m.AsyncWALFailures.Load(),
 		BytesWrittenWAL:   m.BytesWrittenWAL.Load(),
 	}
 	if n := s.WALObjectsWritten; n > 0 {
@@ -100,6 +104,7 @@ func (m *Metrics) RegisterOpenTelemetry(meter metric.Meter) error {
 		{"cloudpebble.engine.orphan_wals_gc", "Total number of orphan WALs garbage collected.", m.OrphanWALsGCd.Load},
 		{"cloudpebble.engine.sync_calls", "Total number of Sync calls.", m.SyncCalls.Load},
 		{"cloudpebble.engine.sync_failures", "Total number of Sync failures.", m.SyncFailures.Load},
+		{"cloudpebble.engine.async_wal_failures", "Total number of async WAL durability failures.", m.AsyncWALFailures.Load},
 		{"cloudpebble.engine.bytes_written_wal", "Total bytes written to WAL objects.", m.BytesWrittenWAL.Load},
 	}
 
