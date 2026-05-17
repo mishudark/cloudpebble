@@ -231,16 +231,24 @@ func encodeTimestampRangeBounds(columnPrefix []byte, startTimestampMicros, endTi
 	startInv := invertedTimestamp(startTimestampMicros)
 	endInv := invertedTimestamp(endTimestampMicros)
 
-	// Skip the cell at exactly endTS.
+	// Skip the cell at exactly endTS. Use saturating arithmetic to
+	// handle the case where endInv == math.MaxUint64 (negative timestamps).
 	shiftedEnd := endInv + 1
+	if shiftedEnd == 0 {
+		shiftedEnd = math.MaxUint64
+	}
 
 	startKey := make([]byte, len(columnPrefix)+8)
 	copy(startKey, columnPrefix)
 	binary.BigEndian.PutUint64(startKey[len(columnPrefix):], shiftedEnd)
 
+	endShifted := startInv + 1
+	if endShifted == 0 {
+		endShifted = math.MaxUint64
+	}
 	endKey := make([]byte, len(columnPrefix)+8)
 	copy(endKey, columnPrefix)
-	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], startInv+1)
+	binary.BigEndian.PutUint64(endKey[len(columnPrefix):], endShifted)
 
 	return startKey, endKey
 }

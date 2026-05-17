@@ -171,7 +171,7 @@ type Engine struct {
 // Open creates or recovers an Engine for the given namespace.
 func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if opts.Dir == "" {
-		opts.Dir = os.TempDir()
+		return nil, errors.New("engine: Dir is required")
 	}
 	if opts.Store == nil {
 		return nil, errors.New("engine: objstore.Store is required")
@@ -209,6 +209,9 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	if err := os.MkdirAll(opts.Dir, 0750); err != nil {
 		return nil, fmt.Errorf("engine: creating local dir: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(opts.Dir, localWALDir), 0750); err != nil {
+		return nil, fmt.Errorf("engine: creating local WAL dir: %w", err)
+	}
 
 	e := &Engine{
 		ns:             opts.Namespace,
@@ -234,8 +237,6 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.ctx = ctx
 	e.cancel = cancel
-
-	e.walMgr.SetContext(ctx)
 
 	e.wg.Add(1)
 	go e.syncLoop(opts.SyncInterval)
@@ -332,6 +333,10 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	e.dbMu.RLock()
+	db := e.db
+	e.dbMu.RUnlock()
+
 	for _, entry := range entries {
 		if entry.Seq <= e.maxWALSeq {
 			continue
@@ -340,12 +345,12 @@ func (e *Engine) replayWALs(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("reading WAL seq %d: %w", entry.Seq, err)
 		}
-		batch := e.db.NewBatch()
+		batch := db.NewBatch()
 		if err := batch.SetRepr(data); err != nil {
 			_ = batch.Close()
 			return fmt.Errorf("setting WAL repr seq %d: %w", entry.Seq, err)
 		}
-		if err := e.db.Apply(batch, pebble.NoSync); err != nil {
+		if err := db.Apply(batch, pebble.NoSync); err != nil {
 			_ = batch.Close()
 			return fmt.Errorf("replaying WAL seq %d: %w", entry.Seq, err)
 		}
@@ -451,9 +456,6 @@ func (e *Engine) applyThenWALAsync(ctx context.Context, batch *pebble.Batch, dat
 
 	// Write the WAL to local SSD with fsync — this is the durability barrier.
 	localPath := e.localWALPath(seq)
-	if mkErr := os.MkdirAll(filepath.Dir(localPath), 0750); mkErr != nil {
-		return 0, fmt.Errorf("engine: creating local WAL dir: %w", mkErr)
-	}
 	if wrErr := writeFileSync(localPath, data, 0600); wrErr != nil {
 		return 0, fmt.Errorf("engine: writing local WAL: %w", wrErr)
 	}
@@ -493,9 +495,11 @@ func (e *Engine) applyThenWALAsync(ctx context.Context, batch *pebble.Batch, dat
 			case <-e.ctx.Done():
 			}
 		})
-	} else {
-		_ = os.Remove(localPath)
 	}
+	// When batching (done == nil), the local WAL is NOT deleted here because
+	// the batch may not yet have been flushed to GCS. It will be cleaned up
+	// on restart (replayLocalWALs replays and removes it) or by the periodic
+	// cleanup in syncLoop.
 
 	return seq, nil
 }
@@ -570,17 +574,18 @@ func (e *Engine) Apply(ctx context.Context, batch *pebble.Batch) error {
 // cache and the cold-miss threshold is exceeded, the engine triggers a
 // background recovery from object storage.
 func (e *Engine) Get(key []byte) ([]byte, error) {
+	// Read under dbMu to prevent the DB from being swapped by cold recovery
+	// between reading the pointer and using it.
 	e.dbMu.RLock()
 	db := e.db
-	e.dbMu.RUnlock()
-
-	if e.recovering.Load() {
-		e.dbMu.RLock()
-		db = e.db
+	if db == nil {
 		e.dbMu.RUnlock()
+		return nil, pebble.ErrNotFound
 	}
 
 	val, closer, err := db.Get(key)
+	e.dbMu.RUnlock()
+
 	if err != nil {
 		e.metrics.Gets.Add(1)
 		if err == pebble.ErrNotFound {
@@ -693,9 +698,9 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 
 	e.dbMu.RLock()
 	db := e.db
-	e.dbMu.RUnlock()
 
 	flushDone, err := db.AsyncFlush()
+	e.dbMu.RUnlock()
 	if err != nil {
 		return fmt.Errorf("engine: flush: %w", err)
 	}
@@ -857,9 +862,9 @@ func (e *Engine) checkEviction() {
 
 	e.dbMu.RLock()
 	db := e.db
+	m := db.Metrics()
 	e.dbMu.RUnlock()
 
-	m := db.Metrics()
 	if m.DiskSpaceUsage() <= uint64(e.maxLocalBytes) {
 		return
 	}
@@ -896,6 +901,11 @@ func (e *Engine) replayLocalWALs(ctx context.Context) error {
 		}
 		return err
 	}
+
+	e.dbMu.RLock()
+	db := e.db
+	e.dbMu.RUnlock()
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -905,12 +915,12 @@ func (e *Engine) replayLocalWALs(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("reading local WAL %s: %w", entry.Name(), err)
 		}
-		batch := e.db.NewBatch()
+		batch := db.NewBatch()
 		if err := batch.SetRepr(data); err != nil {
 			_ = batch.Close()
 			return fmt.Errorf("setting local WAL repr %s: %w", entry.Name(), err)
 		}
-		if err := e.db.Apply(batch, pebble.NoSync); err != nil {
+		if err := db.Apply(batch, pebble.NoSync); err != nil {
 			_ = batch.Close()
 			return fmt.Errorf("replaying local WAL %s: %w", entry.Name(), err)
 		}
@@ -926,9 +936,9 @@ func (e *Engine) Close() error {
 	e.cancel()
 	e.wg.Wait()
 
-	e.walMgr.Close()
-
+	// Final sync before closing WAL manager — the sync needs walMgr.Flush().
 	if err := e.Sync(context.Background()); err != nil {
+		e.walMgr.Close()
 		e.dbMu.RLock()
 		if e.db != nil {
 			_ = e.db.Close()
@@ -936,6 +946,9 @@ func (e *Engine) Close() error {
 		e.dbMu.RUnlock()
 		return fmt.Errorf("engine: final sync: %w", err)
 	}
+
+	e.walMgr.Close()
+
 	e.dbMu.RLock()
 	defer e.dbMu.RUnlock()
 	return e.db.Close()

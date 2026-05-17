@@ -140,6 +140,10 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 				if rowsLimit > 0 && rowCount > rowsLimit {
 					break
 				}
+				// Reset per-row filter state for the new row.
+				if filterEngine != nil {
+					filterEngine.eval.reset()
+				}
 				lastRowKey = append(lastRowKey[:0], rk...)
 				rowStarted = true
 			}

@@ -1,6 +1,7 @@
 package walcloud_test
 
 import (
+	"bytes"
 	"context"
 	"strconv"
 	"testing"
@@ -311,6 +312,90 @@ func TestBatching_CopiesData(t *testing.T) {
 		}
 	default:
 		// Timer may have already fired before Flush; that's fine.
+	}
+}
+
+// TestMergeBatchSegmentsDataIntegrity verifies that mergeBatchSegments correctly
+// handles segments of various lengths, including edge cases where segments are
+// shorter than batchHeaderLen (12 bytes). Regression test for the bug where
+// segments of length 8-11 were counted in the size pass but silently skipped
+// in the data-copy pass, producing zero-filled corrupt output.
+func TestMergeBatchSegmentsDataIntegrity(t *testing.T) {
+	t.Parallel()
+
+	// Build valid batch segments where each segment contains real batch repr data.
+	// A Pebble batch repr has: 8-byte seqnum + 4-byte count + records.
+	// We need segments >= batchHeaderLen for the "allValid" fast path.
+	makeSegment := func(data []byte) []byte {
+		// 12-byte header + data.
+		buf := make([]byte, 12+len(data))
+		walcloud.SetBatchCount(buf, 1)
+		copy(buf[12:], data)
+		return buf
+	}
+
+	// Segment that is shorter than batchHeaderLen (triggers the fallback path).
+	shortSeg := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a}
+
+	// Two valid segments with different data.
+	seg1 := makeSegment([]byte("hello"))
+	seg2 := makeSegment([]byte("world"))
+
+	// Test 1: valid + short segment → fallback to raw concatenation.
+	result1 := walcloud.MergeBatchSegments([][]byte{seg1, shortSeg})
+	if len(result1) != len(seg1)+len(shortSeg) {
+		t.Fatalf("test1: len=%d, want %d", len(result1), len(seg1)+len(shortSeg))
+	}
+	// Verify both data payloads are present.
+	if !bytes.Contains(result1, []byte("hello")) {
+		t.Fatal("test1: result missing 'hello'")
+	}
+	if !bytes.Contains(result1, shortSeg) {
+		t.Fatal("test1: result missing shortSeg content")
+	}
+
+	// Test 2: two valid segments → fast path with header stripping.
+	result2 := walcloud.MergeBatchSegments([][]byte{seg1, seg2})
+	want2 := len(seg1) + len(seg2) - 12 // one header stripped
+	if len(result2) != want2 {
+		t.Fatalf("test2: len=%d, want %d", len(result2), want2)
+	}
+	if !bytes.Contains(result2, []byte("hello")) {
+		t.Fatal("test2: result missing 'hello'")
+	}
+	if !bytes.Contains(result2, []byte("world")) {
+		t.Fatal("test2: result missing 'world'")
+	}
+	if walcloud.BatchCount(result2) != 2 {
+		t.Fatalf("test2: batchCount=%d, want 2", walcloud.BatchCount(result2))
+	}
+
+	// Test 3: short + short + valid → all fallback.
+	result3 := walcloud.MergeBatchSegments([][]byte{shortSeg, []byte{0x01}, seg1})
+	want3 := len(shortSeg) + 1 + len(seg1)
+	if len(result3) != want3 {
+		t.Fatalf("test3: len=%d, want %d", len(result3), want3)
+	}
+	if !bytes.Contains(result3, shortSeg) {
+		t.Fatal("test3: result missing shortSeg")
+	}
+	if !bytes.Contains(result3, []byte{0x01}) {
+		t.Fatal("test3: result missing 0x01")
+	}
+	if !bytes.Contains(result3, []byte("hello")) {
+		t.Fatal("test3: result missing 'hello'")
+	}
+
+	// Test 4: single segment (no merge needed).
+	result4 := walcloud.MergeBatchSegments([][]byte{seg1})
+	if len(result4) != len(seg1) {
+		t.Fatalf("test4: len=%d, want %d", len(result4), len(seg1))
+	}
+
+	// Test 5: empty.
+	result5 := walcloud.MergeBatchSegments(nil)
+	if result5 != nil {
+		t.Fatal("test5: expected nil")
 	}
 }
 

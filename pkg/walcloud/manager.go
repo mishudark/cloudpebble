@@ -45,7 +45,6 @@ const (
 type Manager struct {
 	store objstore.Store
 	ns    string
-	ctx   context.Context
 
 	batchWindow time.Duration // 0 = no batching
 
@@ -59,6 +58,7 @@ type Manager struct {
 	commitTimer *time.Timer
 	closed      atomic.Bool
 	wg          sync.WaitGroup // tracks in-flight batch flush goroutines
+	flushMu     sync.Mutex     // serializes Flush() with background flushes
 }
 
 // NewManager creates a new WAL manager for the given namespace.
@@ -87,11 +87,10 @@ func NewManager(store objstore.Store, namespace string, batchWindow time.Duratio
 	return m, nil
 }
 
-// SetContext sets the context used for background operations such as
-// batch flush goroutines.
-func (m *Manager) SetContext(ctx context.Context) {
-	m.ctx = ctx
-}
+// SetContext is a no-op retained for backward compatibility.
+// Background flushes always use context.Background() so that
+// shutdown cancellation does not silently lose batched data.
+func (m *Manager) SetContext(_ context.Context) {}
 
 // Close stops the timer, prevents further writes, and waits for any
 // in-flight batch flush to complete so that callers can safely close
@@ -112,6 +111,9 @@ func (m *Manager) Close() {
 // launched flush goroutines to finish. After Flush returns, all WAL data
 // written before the call is durable in object storage.
 func (m *Manager) Flush(ctx context.Context) error {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
 	m.mu.Lock()
 	if m.commitTimer != nil {
 		m.commitTimer.Stop()
@@ -133,6 +135,7 @@ func (m *Manager) Flush(ctx context.Context) error {
 	data := mergeBatchSegments(segments)
 	p := m.walPath(seq)
 
+	// Track this flush so Close().Wait() properly waits for it.
 	m.wg.Add(1)
 	err := m.store.Put(ctx, p, data)
 	m.wg.Done()
@@ -184,6 +187,10 @@ func (m *Manager) WriteRecord(ctx context.Context, data []byte) (seq uint64, don
 
 	// Batching path: O(1) per writer under a short-lived mutex.
 	m.mu.Lock()
+	if m.closed.Load() {
+		m.mu.Unlock()
+		return 0, nil, errors.New("walcloud: manager is closed")
+	}
 	if m.pending == nil {
 		m.pendingSeq = atomic.AddUint64(&m.nextSeq, 1) - 1
 		m.pending = make([][]byte, 0, 16)
@@ -212,6 +219,9 @@ func (m *Manager) flushPending() {
 	m.pending = nil
 	m.pendingSeq = 0
 	m.waiters = nil
+	if len(segments) > 0 {
+		m.wg.Add(1)
+	}
 	m.mu.Unlock()
 
 	if len(segments) == 0 {
@@ -221,19 +231,20 @@ func (m *Manager) flushPending() {
 	data := mergeBatchSegments(segments)
 	p := m.walPath(seq)
 
-	m.wg.Go(func() {
-		var gcsErr error
-		ctx := m.ctx
-		if ctx == nil {
-			ctx = context.Background()
-		}
-		if err := m.store.Put(ctx, p, data); err != nil {
-			gcsErr = fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
+	go func() {
+		defer m.wg.Done()
+		// Always use context.Background() for background flushes so that
+		// shutdown cancellation does not silently lose the batch data.
+		if err := m.store.Put(context.Background(), p, data); err != nil {
+			for _, ch := range waiters {
+				ch <- fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
+			}
+			return
 		}
 		for _, ch := range waiters {
-			ch <- gcsErr
+			ch <- nil
 		}
-	})
+	}()
 }
 
 // batchHeaderLen is the Pebble batch repr header size (seqnum + count).
@@ -267,11 +278,9 @@ func mergeBatchSegments(segments [][]byte) []byte {
 	total := len(segments[0])
 	allValid := len(segments[0]) >= batchHeaderLen
 	for _, s := range segments[1:] {
-		if len(s) < 8 {
+		if len(s) < batchHeaderLen {
 			allValid = false
 			total += len(s) // can't strip header, just append raw
-		} else if len(s) < batchHeaderLen {
-			total += len(s)
 		} else {
 			total += len(s) - batchHeaderLen
 		}
@@ -291,9 +300,7 @@ func mergeBatchSegments(segments [][]byte) []byte {
 
 	for _, s := range segments[1:] {
 		totalCount += batchCount(s)
-		if len(s) <= batchHeaderLen {
-			continue
-		}
+		// All segments are valid at this point (len >= batchHeaderLen).
 		pos += copy(result[pos:], s[batchHeaderLen:])
 	}
 

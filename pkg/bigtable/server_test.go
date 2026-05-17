@@ -2,6 +2,7 @@ package bigtable
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -56,6 +57,36 @@ func TestServerCloseMultipleTables(t *testing.T) {
 
 	if err := s.Close(); err != nil {
 		t.Fatalf("close error: %v", err)
+	}
+}
+
+// TestCloseClosesAllEngines verifies that Close() resets the table map,
+// proving all engines were iterated. Regression test for the bug where
+// Close() returned immediately on the first engine close failure.
+func TestCloseClosesAllEngines(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// Open three tables.
+	for i := range 3 {
+		name := fmt.Sprintf("table-%d", i)
+		_, err := s.getEngine(ctx, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Close the server — should not panic or return early.
+	if err := s.Close(); err != nil {
+		t.Fatalf("close error: %v", err)
+	}
+
+	// Server's table map should be reset.
+	s.mu.RLock()
+	tableCount := len(s.tables)
+	s.mu.RUnlock()
+	if tableCount != 0 {
+		t.Fatalf("tables left after Close: %d", tableCount)
 	}
 }
 

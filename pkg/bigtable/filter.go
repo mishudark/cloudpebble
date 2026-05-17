@@ -2,8 +2,7 @@ package bigtable
 
 import (
 	"bytes"
-	cryptorand "crypto/rand"
-	"encoding/binary"
+	"math/rand/v2"
 	"regexp"
 	"slices"
 	"strings"
@@ -246,15 +245,11 @@ func buildCondition(cond *bigtablepb.RowFilter_Condition) (*conditionFilter, err
 }
 
 func (c *conditionFilter) evaluate(cell cellInfo) bool {
-	if !c.evaluated {
-		c.matched = c.predicate.evaluate(cell)
-		c.evaluated = true
-	}
-	if c.matched {
+	if c.predicate.evaluate(cell) {
 		if c.trueFilter != nil {
 			return c.trueFilter.evaluate(cell)
 		}
-		return false
+		return true
 	}
 	if c.falseFilter != nil {
 		return c.falseFilter.evaluate(cell)
@@ -577,7 +572,7 @@ type rowSampleFilter struct {
 func (r *rowSampleFilter) evaluate(cell cellInfo) bool {
 	if !bytes.Equal(cell.rowKey, r.seenRow) {
 		r.seenRow = append(r.seenRow[:0], cell.rowKey...)
-		r.sampleRow = cryptoRandFloat64() < r.rate
+		r.sampleRow = randFloat64() < r.rate
 	}
 	return r.sampleRow
 }
@@ -585,12 +580,8 @@ func (r *rowSampleFilter) reset() {
 	r.seenRow = r.seenRow[:0]
 }
 
-func cryptoRandFloat64() float64 {
-	var buf [8]byte
-	_, _ = cryptorand.Read(buf[:])
-	// Use top 53 bits as the mantissa for a float64 in [0, 1).
-	v := binary.BigEndian.Uint64(buf[:]) >> 11
-	return float64(v) / (1 << 53)
+func randFloat64() float64 {
+	return rand.Float64() //nolint:gosec // statistical sampling, not cryptographic
 }
 
 // --- Filter engine methods ---
@@ -605,7 +596,8 @@ func (e *rowFilterEngine) hasMatch(iter *pebble.Iterator) bool {
 		if !ok {
 			continue
 		}
-		if e.eval.evaluate(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts}) {
+		val := iter.Value()
+		if e.eval.evaluate(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
 			hasAny = true
 			break
 		}
@@ -660,8 +652,8 @@ func evaluatorHasStripValue(e filterEvaluator) bool {
 // the filter. Returns false if processing was stopped early.
 func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 	e.eval.reset()
-	_, stripValue := e.eval.(*stripValueFilter)
-	af, applyLabel := e.eval.(*applyLabelFilter)
+	stripValue := evaluatorHasStripValue(e.eval)
+	labels := evaluatorCollectLabels(e.eval)
 
 	for iter.First(); iter.Valid(); iter.Next() {
 		rowKey, family, qualifier, ts, ok := DecodeCellKey(iter.Key())
@@ -670,7 +662,7 @@ func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 		}
 
 		val := iter.Value()
-		if len(val) > 0 {
+		if len(val) > 0 && !stripValue {
 			val = append([]byte(nil), val...)
 		}
 		ci := cellInfo{
@@ -689,14 +681,43 @@ func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 			val = nil
 		}
 
-		var labels []string
-		if applyLabel {
-			labels = append(labels, af.label)
-		}
-
 		rp.Matched = true
 		if !rp.OnCell(rowKey, family, qualifier, ts, val, labels) {
 			return
 		}
 	}
+}
+
+// evaluatorCollectLabels returns the labels from all applyLabelFilter instances
+// in the evaluation tree.
+func evaluatorCollectLabels(e filterEvaluator) []string {
+	switch f := e.(type) {
+	case *applyLabelFilter:
+		return []string{f.label}
+	case *chainFilter:
+		var labels []string
+		for _, sub := range f.filters {
+			labels = append(labels, evaluatorCollectLabels(sub)...)
+		}
+		return labels
+	case *interleaveFilter:
+		var labels []string
+		for _, sub := range f.filters {
+			labels = append(labels, evaluatorCollectLabels(sub)...)
+		}
+		return labels
+	case *conditionFilter:
+		var labels []string
+		if f.predicate != nil {
+			labels = append(labels, evaluatorCollectLabels(f.predicate)...)
+		}
+		if f.trueFilter != nil {
+			labels = append(labels, evaluatorCollectLabels(f.trueFilter)...)
+		}
+		if f.falseFilter != nil {
+			labels = append(labels, evaluatorCollectLabels(f.falseFilter)...)
+		}
+		return labels
+	}
+	return nil
 }

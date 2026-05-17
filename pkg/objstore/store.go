@@ -8,9 +8,14 @@ package objstore
 
 import (
 	"context"
+	"errors"
 	"io"
 	"time"
 )
+
+// ErrNotFound is returned by Get, Attrs, and GetReader when an object does
+// not exist. Backends should wrap this sentinel so callers can use errors.Is.
+var ErrNotFound = errors.New("object not found")
 
 // ObjectInfo holds metadata about an object in the store.
 type ObjectInfo struct {
