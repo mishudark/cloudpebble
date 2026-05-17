@@ -736,37 +736,46 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 			strings.HasPrefix(name, "marker.manifest")
 	}
 
+	// Save the previous uploaded set, then rebuild from scratch for this sync.
+	// This bounds the uploadedFiles map to the current checkpoint and prevents
+	// unbounded growth across error-retry cycles.
+	e.uploadedMu.Lock()
+	prevFiles := e.uploadedFiles
+	e.uploadedFiles = make(map[string]struct{}, len(entries))
+	e.uploadedMu.Unlock()
+
 	checkpointFiles := make(map[string]bool, len(entries))
 	manifestFiles := make([]ManifestFile, 0, len(entries))
 	for _, entry := range entries {
 		checkpointFiles[entry.Name()] = true
+		name := entry.Name()
+		localPath := filepath.Clean(filepath.Join(checkpointDir, name))
+		remotePath := filepath.ToSlash(filepath.Join(dataPrefix, name))
 
-		localPath := filepath.Clean(filepath.Join(checkpointDir, entry.Name()))
-		var data []byte
-		data, err = os.ReadFile(localPath)
-		if err != nil {
-			return fmt.Errorf("engine: reading checkpoint file %s: %w", entry.Name(), err)
+		data, rErr := os.ReadFile(localPath)
+		if rErr != nil {
+			return fmt.Errorf("engine: reading checkpoint file %s: %w", name, rErr)
 		}
 
 		h := sha256.Sum256(data)
-		manifestFiles = append(manifestFiles, ManifestFile{
-			Name:     entry.Name(),
+		mf := ManifestFile{
+			Name:     name,
 			Size:     int64(len(data)),
 			Checksum: hex.EncodeToString(h[:]),
-		})
+		}
+		manifestFiles = append(manifestFiles, mf)
 
-		remotePath := filepath.ToSlash(filepath.Join(dataPrefix, entry.Name()))
-
-		e.uploadedMu.Lock()
-		_, alreadyUploaded := e.uploadedFiles[remotePath]
-		e.uploadedMu.Unlock()
-
-		if alreadyUploaded && !isMutable(entry.Name()) {
+		// Incremental: skip upload for non-mutable files already in storage.
+		_, alreadyUploaded := prevFiles[remotePath]
+		if alreadyUploaded && !isMutable(name) {
+			e.uploadedMu.Lock()
+			e.uploadedFiles[remotePath] = struct{}{}
+			e.uploadedMu.Unlock()
 			continue
 		}
 
 		if err = e.store.Put(ctx, remotePath, data); err != nil {
-			return fmt.Errorf("engine: uploading %s: %w", entry.Name(), err)
+			return fmt.Errorf("engine: uploading %s: %w", name, err)
 		}
 
 		e.uploadedMu.Lock()
@@ -774,15 +783,16 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		e.uploadedMu.Unlock()
 	}
 
+	// Clean up stale files: files that were uploaded in the previous sync
+	// but are no longer in the current checkpoint. Best-effort; errors
+	// are logged but do not abort the sync.
 	e.uploadedMu.Lock()
-	for remotePath := range e.uploadedFiles {
+	for remotePath := range prevFiles {
 		base := filepath.Base(remotePath)
 		if !checkpointFiles[base] {
-			if err = e.store.Delete(ctx, remotePath); err != nil {
-				e.uploadedMu.Unlock()
-				return fmt.Errorf("engine: deleting stale file %s: %w", base, err)
+			if delErr := e.store.Delete(ctx, remotePath); delErr != nil {
+				e.logger.Warn("engine: deleting stale file", "file", base, "error", delErr)
 			}
-			delete(e.uploadedFiles, remotePath)
 		}
 	}
 	e.uploadedMu.Unlock()

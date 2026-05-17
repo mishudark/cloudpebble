@@ -13,10 +13,12 @@ import (
 
 // rowFilterEngine evaluates a RowFilter against a Pebble iterator.
 type rowFilterEngine struct {
-	eval filterEvaluator
+	eval       filterEvaluator
+	stripValue bool
+	labels     []string
 }
 
-// newRowFilterEngine creates the filter evaluation tree for a RowFilter.
+// newRowFilterEngine creates the evaluation tree for a RowFilter.
 func newRowFilterEngine(filter *bigtablepb.RowFilter) (*rowFilterEngine, error) {
 	if filter == nil {
 		return &rowFilterEngine{eval: &passAllFilter{}}, nil
@@ -25,7 +27,11 @@ func newRowFilterEngine(filter *bigtablepb.RowFilter) (*rowFilterEngine, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &rowFilterEngine{eval: eval}, nil
+	return &rowFilterEngine{
+		eval:       eval,
+		stripValue: evaluatorHasStripValue(eval),
+		labels:     evaluatorCollectLabels(eval),
+	}, nil
 }
 
 // cellInfo holds the decoded cell data passed through filter stages.
@@ -590,9 +596,10 @@ func randFloat64() float64 {
 func (e *rowFilterEngine) hasMatch(iter *pebble.Iterator) bool {
 	e.eval.reset()
 	hasAny := false
+	var dec CellDecoder
 	iter.First()
 	for ; iter.Valid(); iter.Next() {
-		rowKey, family, qualifier, ts, ok := DecodeCellKey(iter.Key())
+		rowKey, family, qualifier, ts, ok := dec.Decode(iter.Key())
 		if !ok {
 			continue
 		}
@@ -616,10 +623,10 @@ func (e *rowFilterEngine) matchesCell(rowKey []byte, family string, qualifier []
 	})
 }
 
-// hasStripValue reports whether the filter engine (or chain/interleave
-// sub-filters) contains a strip-value transformer.
+// hasStripValue reports whether the filter engine contains a strip-value
+// transformer. Uses the precomputed cached field.
 func (e *rowFilterEngine) hasStripValue() bool {
-	return evaluatorHasStripValue(e.eval)
+	return e.stripValue
 }
 
 func evaluatorHasStripValue(e filterEvaluator) bool {
@@ -652,28 +659,25 @@ func evaluatorHasStripValue(e filterEvaluator) bool {
 // the filter. Returns false if processing was stopped early.
 func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 	e.eval.reset()
-	stripValue := evaluatorHasStripValue(e.eval)
-	labels := evaluatorCollectLabels(e.eval)
+	stripValue := e.stripValue
+	labels := e.labels
+
+	var dec CellDecoder
+	var cell processCell
 
 	for iter.First(); iter.Valid(); iter.Next() {
-		rowKey, family, qualifier, ts, ok := DecodeCellKey(iter.Key())
+		rowKey, family, qualifier, ts, ok := dec.Decode(iter.Key())
 		if !ok {
 			continue
 		}
 
 		val := iter.Value()
 		if len(val) > 0 && !stripValue {
-			val = append([]byte(nil), val...)
-		}
-		ci := cellInfo{
-			rowKey:    rowKey,
-			family:    family,
-			qualifier: qualifier,
-			ts:        ts,
-			value:     val,
+			cell.valueBuf = append(cell.valueBuf[:0], val...)
+			val = cell.valueBuf
 		}
 
-		if !e.eval.evaluate(ci) {
+		if !e.eval.evaluate(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
 			continue
 		}
 
@@ -681,11 +685,22 @@ func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 			val = nil
 		}
 
+		// Copy rowKey and qualifier so the callback can retain them.
+		cell.rowKeyBuf = append(cell.rowKeyBuf[:0], rowKey...)
+		cell.qualBuf = append(cell.qualBuf[:0], qualifier...)
+
 		rp.Matched = true
-		if !rp.OnCell(rowKey, family, qualifier, ts, val, labels) {
+		if !rp.OnCell(cell.rowKeyBuf, family, cell.qualBuf, ts, val, labels) {
 			return
 		}
 	}
+}
+
+// processCell reuses buffers across process iterations.
+type processCell struct {
+	rowKeyBuf  []byte
+	qualBuf    []byte
+	valueBuf   []byte
 }
 
 // evaluatorCollectLabels returns the labels from all applyLabelFilter instances
