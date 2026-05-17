@@ -3,6 +3,7 @@ package bigtable
 import (
 	"context"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -145,6 +146,23 @@ func (s *Server) CheckAndMutateRow(ctx context.Context, req *bigtablepb.CheckAnd
 		return nil, status.Errorf(codes.Internal, "opening table: %v", err)
 	}
 
+	// Look up the table state to get the row-level lock.
+	s.mu.RLock()
+	ts, ok := s.tables[req.GetTableName()]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "table %q not found", req.GetTableName())
+	}
+
+	// Acquire per-row lock to ensure atomicity of predicate evaluation and
+	// mutation apply. This prevents two concurrent CheckAndMutateRow calls
+	// on the same row from racing on the predicate check.
+	rowKeyStr := string(rowKey)
+	rowLockI, _ := ts.rowLocks.LoadOrStore(rowKeyStr, &sync.Mutex{})
+	rowLock, _ := rowLockI.(*sync.Mutex)
+	rowLock.Lock()
+	defer rowLock.Unlock()
+
 	db := eng.DB()
 	predicateFilter := req.GetPredicateFilter()
 
@@ -236,6 +254,12 @@ func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mu
 }
 
 func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_SetCell) error {
+	if len(sc.GetFamilyName()) > math.MaxUint8 {
+		return status.Error(codes.InvalidArgument, "family name too long (max 255 bytes)")
+	}
+	if len(sc.GetColumnQualifier()) > math.MaxUint16 {
+		return status.Error(codes.InvalidArgument, "column qualifier too long (max 65535 bytes)")
+	}
 	ts := sc.GetTimestampMicros()
 	if ts == -1 {
 		ts = time.Now().UnixMicro()

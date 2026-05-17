@@ -4,6 +4,7 @@ package gcs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,7 +66,7 @@ func (s *Store) Get(ctx context.Context, path string) ([]byte, error) {
 	r, err := s.client.Bucket(s.bucket).Object(s.fullPath(path)).NewReader(ctx)
 	if err != nil {
 		if isNotExist(err) {
-			return nil, fmt.Errorf("gcs: object %s: %w", path, err)
+			return nil, fmt.Errorf("gcs: object %s: %w", path, objstore.ErrNotFound)
 		}
 		return nil, fmt.Errorf("gcs: reading %s: %w", path, err)
 	}
@@ -117,7 +118,10 @@ func (s *Store) Exists(ctx context.Context, path string) (bool, error) {
 func (s *Store) Attrs(ctx context.Context, path string) (objstore.ObjectInfo, error) {
 	attrs, err := s.client.Bucket(s.bucket).Object(s.fullPath(path)).Attrs(ctx)
 	if err != nil {
-		return objstore.ObjectInfo{}, err
+		if isNotExist(err) {
+			return objstore.ObjectInfo{}, fmt.Errorf("gcs: object %s: %w", path, objstore.ErrNotFound)
+		}
+		return objstore.ObjectInfo{}, fmt.Errorf("gcs: attrs %s: %w", path, err)
 	}
 	return objstore.ObjectInfo{
 		Path:      path,
@@ -155,10 +159,11 @@ func (s *Store) GetReader(ctx context.Context, path string) (io.ReadCloser, erro
 }
 
 func isNotExist(err error) bool {
-	if err == storage.ErrObjectNotExist {
+	if errors.Is(err, storage.ErrObjectNotExist) {
 		return true
 	}
-	if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == http.StatusNotFound {
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) && gerr.Code == http.StatusNotFound {
 		return true
 	}
 	return false

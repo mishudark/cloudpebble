@@ -134,6 +134,10 @@ func main() {
 		{"DeleteTimestampRange", testDeleteTimestampRange},
 		{"SampleRowKeys", testSampleRowKeys},
 		{"ConcurrentWrites", testConcurrentWrites},
+		{"CheckAndMutateRow/ValuePredicate", testCheckAndMutateValuePredicate},
+		{"CheckAndMutateRow/ConcurrentSameRow", testCheckAndMutateConcurrentSameRow},
+		{"ReadRows/CellsPerRowLimitMultiRow", testReadRowsCellsPerRowLimitMultiRow},
+		{"ReadRows/CellsPerRowOffsetMultiRow", testReadRowsCellsPerRowOffsetMultiRow},
 	} {
 		if err := test.fn(ctx, tbl); err != nil {
 			fmt.Printf("  FAIL  %s: %v\n", test.name, err)
@@ -593,6 +597,207 @@ func testReadRowsManyCellsSingleRow(ctx context.Context, tbl *bigtable.Table) er
 	}
 	if len(row["cf1"]) != 50 {
 		return fmt.Errorf("expected 50 cells, got %d", len(row["cf1"]))
+	}
+
+	del := bigtable.NewMutation()
+	del.DeleteRow()
+	return tbl.Apply(ctx, key, del)
+}
+
+// ---------------------------------------------------------------------------
+// CellsPerRowLimit across multiple rows (filter state reset between rows)
+// ---------------------------------------------------------------------------
+
+func testReadRowsCellsPerRowLimitMultiRow(ctx context.Context, tbl *bigtable.Table) error {
+	// Write 2 cells in row1 and 2 cells in row2.
+	for _, key := range []string{"cpr-row1", "cpr-row2"} {
+		mut := bigtable.NewMutation()
+		mut.Set("cf1", "a", bigtable.Now(), []byte(key+"-a"))
+		mut.Set("cf1", "b", bigtable.Now(), []byte(key+"-b"))
+		if err := tbl.Apply(ctx, key, mut); err != nil {
+			return fmt.Errorf("setup write %s: %w", key, err)
+		}
+	}
+
+	// Read with CellsPerRowLimit(1) — should get exactly 1 cell per row.
+	var totalCells int
+	seenRows := make(map[string]bool)
+	err := tbl.ReadRows(ctx, bigtable.RowRange{},
+		func(r bigtable.Row) bool {
+			seenRows[r.Key()] = true
+			for _, items := range r {
+				totalCells += len(items)
+			}
+			return true
+		},
+		bigtable.LimitRows(2),           // read at most 2 rows
+		bigtable.RowFilter(bigtable.CellsPerRowLimitFilter(1)),  // 1 cell per row
+	)
+	if err != nil {
+		return fmt.Errorf("ReadRows: %w", err)
+	}
+	if totalCells != 2 {
+		return fmt.Errorf("expected 2 cells (1 per row), got %d", totalCells)
+	}
+	if len(seenRows) != 2 {
+		return fmt.Errorf("expected 2 rows, got %d: %v", len(seenRows), seenRows)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// CellsPerRowOffset across multiple rows (filter state reset between rows)
+// ---------------------------------------------------------------------------
+
+func testReadRowsCellsPerRowOffsetMultiRow(ctx context.Context, tbl *bigtable.Table) error {
+	// Write 3 cells in each of 2 rows.
+	for _, key := range []string{"cpo-row1", "cpo-row2"} {
+		mut := bigtable.NewMutation()
+		mut.Set("cf1", "a", bigtable.Now(), []byte(key+"-a"))
+		mut.Set("cf1", "b", bigtable.Now(), []byte(key+"-b"))
+		mut.Set("cf1", "c", bigtable.Now(), []byte(key+"-c"))
+		if err := tbl.Apply(ctx, key, mut); err != nil {
+			return fmt.Errorf("setup write %s: %w", key, err)
+		}
+	}
+
+	// Read with CellsPerRowOffsetFilter(1) — skips first cell, returns 2 per row.
+	var totalCells int
+	seenRows := make(map[string]bool)
+	err := tbl.ReadRows(ctx, bigtable.RowRange{},
+		func(r bigtable.Row) bool {
+			seenRows[r.Key()] = true
+			for _, items := range r {
+				totalCells += len(items)
+			}
+			return true
+		},
+		bigtable.LimitRows(2),
+		bigtable.RowFilter(bigtable.CellsPerRowOffsetFilter(1)),
+	)
+	if err != nil {
+		return fmt.Errorf("ReadRows: %w", err)
+	}
+	if totalCells != 4 {
+		return fmt.Errorf("expected 4 cells (3-1 per row × 2 rows), got %d", totalCells)
+	}
+	if len(seenRows) != 2 {
+		return fmt.Errorf("expected 2 rows, got %d: %v", len(seenRows), seenRows)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// CheckAndMutateRow with value-based predicate
+// ---------------------------------------------------------------------------
+
+func testCheckAndMutateValuePredicate(ctx context.Context, tbl *bigtable.Table) error {
+	key := "check-value-pred"
+	// Write a cell with a specific value.
+	mut := bigtable.NewMutation()
+	mut.Set("cf1", "status", bigtable.Now(), []byte("active"))
+	if err := tbl.Apply(ctx, key, mut); err != nil {
+		return fmt.Errorf("setup: %w", err)
+	}
+
+	// CheckAndMutateRow: predicate is valueRegexFilter("active").
+	// Should match and apply the true mutation.
+	trueMut := bigtable.NewMutation()
+	trueMut.Set("cf1", "result", bigtable.Now(), []byte("matched"))
+	condMut := bigtable.NewCondMutation(bigtable.ValueFilter("active"), trueMut, nil)
+
+	var matched bool
+	err := tbl.Apply(ctx, key, condMut, bigtable.GetCondMutationResult(&matched))
+	if err != nil {
+		return fmt.Errorf("CheckAndMutateRow value predicate: %w", err)
+	}
+	if !matched {
+		return errors.New("expected predicate matched=true for value 'active'")
+	}
+
+	row, err := tbl.ReadRow(ctx, key)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.New("row not found")
+	}
+	found := false
+	for _, items := range row {
+		for _, item := range items {
+			if string(item.Value) == "matched" {
+				found = true
+			}
+		}
+	}
+	if !found {
+		return errors.New("expected cf1:result=matched cell from true mutation")
+	}
+
+	del := bigtable.NewMutation()
+	del.DeleteRow()
+	return tbl.Apply(ctx, key, del)
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent CheckAndMutateRow on the same row (no TOCTOU race)
+// ---------------------------------------------------------------------------
+
+func testCheckAndMutateConcurrentSameRow(ctx context.Context, tbl *bigtable.Table) error {
+	key := "concurrent-check-row"
+
+	// Seed the row.
+	mut := bigtable.NewMutation()
+	mut.Set("cf1", "data", bigtable.Now(), []byte("initial"))
+	if err := tbl.Apply(ctx, key, mut); err != nil {
+		return fmt.Errorf("setup: %w", err)
+	}
+
+	// Launch 5 concurrent CheckAndMutateRow calls on the same row.
+	// Each checks if the row exists (passAll) and writes a unique marker.
+	var wg sync.WaitGroup
+	errCh := make(chan error, 5)
+	for i := range 5 {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			trueMut := bigtable.NewMutation()
+			trueMut.Set("cf1", fmt.Sprintf("marker-%d", n), bigtable.Now(), []byte("done"))
+			condMut := bigtable.NewCondMutation(bigtable.PassAllFilter(), trueMut, nil)
+			if err := tbl.Apply(ctx, key, condMut); err != nil {
+				errCh <- fmt.Errorf("concurrent %d: %w", n, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+
+	// Verify all markers were applied.
+	row, err := tbl.ReadRow(ctx, key)
+	if err != nil {
+		return err
+	}
+	if row == nil {
+		return errors.New("row not found after concurrent CheckAndMutateRow")
+	}
+	for i := range 5 {
+		found := false
+		for _, items := range row {
+			for _, item := range items {
+				if item.Column == fmt.Sprintf("cf1:marker-%d", i) {
+					found = true
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf("marker-%d not found — CheckAndMutateRow may have lost an update", i)
+		}
 	}
 
 	del := bigtable.NewMutation()

@@ -40,12 +40,13 @@ func (s *Server) SampleRowKeys(req *bigtablepb.SampleRowKeysRequest, stream grpc
 					return err
 				}
 			}
-		if sst.Size > math.MaxInt64 {
+			// Use saturating addition to avoid capping at MaxInt64 permanently.
+			remaining := math.MaxInt64 - offsetBytes
+			if sst.Size > uint64(remaining) {
 				offsetBytes = math.MaxInt64
-				continue
+			} else {
+				offsetBytes += int64(sst.Size) //nolint:gosec
 			}
-			// G115: bounds-checked above to guarantee sst.Size ≤ MaxInt64.
-			offsetBytes += int64(sst.Size) //nolint:gosec
 		}
 	}
 

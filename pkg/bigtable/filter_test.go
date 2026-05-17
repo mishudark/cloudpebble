@@ -360,9 +360,9 @@ func TestConditionFilterNoTrueFilter(t *testing.T) {
 		predicate:  &passAllFilter{},
 		falseFilter: &passAllFilter{},
 	}
-	// Predicate passes, but true filter is nil → return false.
-	if cond.evaluate(cellInfo{}) {
-		t.Fatal("condition with no true filter should block when predicate matched")
+	// Predicate passes, but true filter is nil → cell should pass through.
+	if !cond.evaluate(cellInfo{}) {
+		t.Fatal("condition with no true filter should pass when predicate matched")
 	}
 }
 
@@ -376,6 +376,59 @@ func TestConditionFilterNoFalseFilter(t *testing.T) {
 		t.Fatal("condition with no false filter should block when predicate not matched")
 	}
 }
+
+// TestConditionFilterPerCellEvaluation verifies that the condition filter
+// evaluates its predicate on every cell, not just the first cell. Regression
+// test for the bug where the predicate result was cached and reused for all
+// subsequent cells.
+func TestConditionFilterPerCellEvaluation(t *testing.T) {
+	// A condition filter where the predicate is a rowSampleFilter (starts false,
+	// becomes true on the second row) and trueFilter is passAll.
+	// If the predicate is only evaluated once, the first cell determines the
+	// outcome for all cells. If evaluated per-cell, each cell is independently
+	// checked.
+	var evalCount int
+	pred := &countingFilter{count: &evalCount}
+	cond := &conditionFilter{
+		predicate:  pred,
+		trueFilter: &passAllFilter{},
+	}
+
+	// First cell: predicate is evaluated → evalCount becomes 1.
+	if !cond.evaluate(cellInfo{}) {
+		t.Fatal("first cell should pass (predicate passes first time)")
+	}
+	if evalCount != 1 {
+		t.Fatalf("evalCount = %d, want 1 (predicate should be called per cell)", evalCount)
+	}
+
+	// Second cell: predicate should be re-evaluated → evalCount becomes 2.
+	if !cond.evaluate(cellInfo{}) {
+		t.Fatal("second cell should pass (predicate re-evaluated)")
+	}
+	if evalCount != 2 {
+		t.Fatalf("evalCount = %d, want 2 (predicate should be re-evaluated per cell)", evalCount)
+	}
+
+	// After reset, fresh start.
+	cond.reset()
+	evalCount = 0
+	cond.evaluate(cellInfo{})
+	if evalCount != 1 {
+		t.Fatalf("after reset: evalCount = %d, want 1", evalCount)
+	}
+}
+
+// countingFilter is a test filter that counts how many times evaluate is called.
+type countingFilter struct {
+	count *int
+}
+
+func (c *countingFilter) evaluate(cellInfo) bool {
+	*c.count++
+	return true
+}
+func (c *countingFilter) reset() {}
 
 func TestConditionFilterReset(t *testing.T) {
 	cond := &conditionFilter{
@@ -873,6 +926,66 @@ func TestFilterEngineProcessRowKeyRegex(t *testing.T) {
 			t.Fatalf("expected all cells from row1, got %v", c.rowKey)
 		}
 	}
+}
+
+// TestFilterEngineHasMatchWithValue verifies that hasMatch populates the
+// value field in cellInfo so that value-based filters (valueRegex, valueRange,
+// valueBitmask) can match. Regression test for the bug where the value field
+// was omitted, causing value-based filters to never match in CheckAndMutateRow.
+func TestFilterEngineHasMatchWithValue(t *testing.T) {
+	// Build a small Pebble DB with a cell that has a specific value.
+	db := pebbleDBWithCell(t, "row1", "cf", "col1", 1000, "target-value")
+
+	iter, err := db.NewIter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = iter.Close() }()
+
+	// Use a valueRegexFilter that matches "target-value".
+	filter := &bigtablepb.RowFilter{
+		Filter: &bigtablepb.RowFilter_ValueRegexFilter{
+			ValueRegexFilter: []byte("target-value"),
+		},
+	}
+	engine, err := newRowFilterEngine(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !engine.hasMatch(iter) {
+		t.Fatal("hasMatch should find the cell with matching value")
+	}
+
+	// Now test with a regex that won't match.
+	db2 := pebbleDBWithCell(t, "row1", "cf", "col1", 1000, "other-value")
+	iter2, err := db2.NewIter(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = iter2.Close() }()
+
+	engine2, err := newRowFilterEngine(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if engine2.hasMatch(iter2) {
+		t.Fatal("hasMatch should NOT find a cell with non-matching value")
+	}
+}
+
+// pebbleDBWithCell creates a temporary Pebble DB with a single cell.
+func pebbleDBWithCell(t *testing.T, rowKey, family, qualifier string, ts int64, value string) *pebble.DB {
+	t.Helper()
+	db, err := pebble.Open(t.TempDir(), &pebble.Options{DisableWAL: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	key := EncodeCellKey([]byte(rowKey), family, []byte(qualifier), ts)
+	if err := db.Set(key, []byte(value), pebble.NoSync); err != nil {
+		t.Fatal(err)
+	}
+	return db
 }
 
 func TestFilterEngineHasMatch(t *testing.T) {

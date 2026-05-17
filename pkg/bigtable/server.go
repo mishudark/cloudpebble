@@ -2,6 +2,7 @@ package bigtable
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -36,6 +37,7 @@ type Server struct {
 
 type tableState struct {
 	engine *engine.Engine
+	rowLocks sync.Map // map[string]*sync.Mutex — per-row locks for CheckAndMutateRow
 }
 
 // NewServer creates a new Bigtable server.
@@ -63,13 +65,14 @@ func (s *Server) SetAsyncWAL(v bool) {
 func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var errs []error
 	for name, ts := range s.tables {
 		if err := ts.engine.Close(); err != nil {
-			return fmt.Errorf("closing table %q: %w", name, err)
+			errs = append(errs, fmt.Errorf("closing table %q: %w", name, err))
 		}
 	}
 	s.tables = make(map[string]*tableState)
-	return nil
+	return errors.Join(errs...)
 }
 
 // tableNamespace converts a Bigtable table name to a cloudpebble namespace.

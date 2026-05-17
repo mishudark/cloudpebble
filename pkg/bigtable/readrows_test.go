@@ -306,6 +306,55 @@ func TestReadRowsWithFilter(t *testing.T) {
 	}
 }
 
+// TestReadRowsCellsPerRowLimitFilterReset verifies that per-row filter state
+// is reset between rows. The cellsPerRowLimitFilter(1) should allow exactly
+// one cell per row, across all rows. Regression test for the bug where
+// row counters accumulated monotonically across rows, causing only the first
+// row to return cells.
+func TestReadRowsCellsPerRowLimitFilterReset(t *testing.T) {
+	s := newTestServer(t)
+	table := benchTable
+	populateTable(t, s, table) // row1 has 3 cells, row2 has 1, row3 has 1
+
+	req := &bigtablepb.ReadRowsRequest{
+		TableName: table,
+		Filter: &bigtablepb.RowFilter{
+			Filter: &bigtablepb.RowFilter_CellsPerRowLimitFilter{
+				CellsPerRowLimitFilter: 1,
+			},
+		},
+	}
+
+	stream := newMockServerStream[*bigtablepb.ReadRowsResponse]()
+	err := s.ReadRows(req, stream)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var allChunks []*bigtablepb.ReadRowsResponse_CellChunk
+	for _, resp := range stream.sent {
+		allChunks = append(allChunks, resp.Chunks...)
+	}
+
+	// With 3 rows and limit=1 per row, we should get 3 cells (one per row).
+	// Each cell should have a different row key.
+	if len(allChunks) != 3 {
+		t.Fatalf("expected 3 chunks (one per row), got %d", len(allChunks))
+	}
+
+	rowKeys := make(map[string]bool)
+	for _, c := range allChunks {
+		rk := string(c.GetRowKey())
+		rowKeys[rk] = true
+	}
+	if len(rowKeys) != 3 {
+		t.Fatalf("expected 3 distinct rows, got %d: %v", len(rowKeys), rowKeys)
+	}
+	if !rowKeys["row1"] || !rowKeys["row2"] || !rowKeys["row3"] {
+		t.Fatalf("missing rows, got: %v", rowKeys)
+	}
+}
+
 func TestReadRowsBlockAllFilter(t *testing.T) {
 	s := newTestServer(t)
 	table := benchTable
