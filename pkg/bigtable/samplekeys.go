@@ -26,15 +26,17 @@ func (s *Server) SampleRowKeys(req *bigtablepb.SampleRowKeysRequest, stream grpc
 	}
 
 	var offsetBytes int64
+	var dec CellDecoder
 	for _, level := range sstInfos {
 		for _, sst := range level {
 			if len(sst.Smallest.UserKey) > 0 {
-				rowKey, _, _, _, ok := DecodeCellKey(sst.Smallest.UserKey)
+				rowKey, _, _, _, ok := dec.Decode(sst.Smallest.UserKey)
 				if !ok || len(rowKey) == 0 {
 					continue
 				}
+				rk := append([]byte(nil), rowKey...)
 				if err := stream.Send(&bigtablepb.SampleRowKeysResponse{
-					RowKey:      rowKey,
+					RowKey:      rk,
 					OffsetBytes: offsetBytes,
 				}); err != nil {
 					return err

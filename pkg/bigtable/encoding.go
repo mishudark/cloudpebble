@@ -4,6 +4,7 @@ package bigtable
 import (
 	"encoding/binary"
 	"math"
+	"slices"
 )
 
 // Key encoding format:
@@ -46,26 +47,44 @@ func timestampFromInverted(inv uint64) int64 {
 //
 // Null bytes (0x00) in the row key are escaped as 0x00 0xFF.
 // The terminator 0x00 0x00 is guaranteed not to appear inside the escaped key.
+// Writes directly into the result buffer, avoiding intermediate allocations.
 func encodeRowPrefix(rowKey []byte) []byte {
-	escaped := escapeNullBytes(rowKey)
-	buf := make([]byte, len(escaped)+2)
-	copy(buf, escaped)
-	buf[len(escaped)] = 0x00
-	buf[len(escaped)+1] = 0x00
+	// Fast path: no null bytes in row key.
+	if slices.Contains(rowKey, 0x00) {
+		return encodeRowPrefixEscaped(rowKey)
+	}
+	buf := make([]byte, len(rowKey)+2)
+	copy(buf, rowKey)
+	buf[len(rowKey)] = 0x00
+	buf[len(rowKey)+1] = 0x00
 	return buf
 }
 
-// escapeNullBytes returns the input with each 0x00 byte replaced by 0x00 0xFF.
-func escapeNullBytes(b []byte) []byte {
-	var out []byte
-	for _, c := range b {
+// encodeRowPrefixEscaped handles row keys containing null bytes.
+func encodeRowPrefixEscaped(rowKey []byte) []byte {
+	// Count null bytes to compute escaped length.
+	nullCount := 0
+	for _, c := range rowKey {
 		if c == 0x00 {
-			out = append(out, 0x00, 0xFF)
-		} else {
-			out = append(out, c)
+			nullCount++
 		}
 	}
-	return out
+	escapedLen := len(rowKey) + nullCount
+	buf := make([]byte, escapedLen+2)
+	pos := 0
+	for _, c := range rowKey {
+		if c == 0x00 {
+			buf[pos] = 0x00
+			buf[pos+1] = 0xFF
+			pos += 2
+		} else {
+			buf[pos] = c
+			pos++
+		}
+	}
+	buf[escapedLen] = 0x00
+	buf[escapedLen+1] = 0x00
+	return buf
 }
 
 // encodeFamilyPrefix returns the key prefix that identifies a column family
@@ -114,75 +133,183 @@ func EncodeCellKey(rowKey []byte, family string, qualifier []byte, timestampMicr
 	return buf
 }
 
-// DecodeCellKey decodes a Pebble key back into its Bigtable components.
-// Returns false if the key format is invalid.
-func DecodeCellKey(key []byte) (rowKey []byte, family string, qualifier []byte, timestampMicros int64, ok bool) {
-	// Decode escaped row key. Scan for null-byte pairs:
-	//   0x00 0xFF → escaped null (part of row key)
-	//   0x00 0x00 → row terminator
-	var rowBytes []byte
+// CellDecoder is a reusable decoder that decodes Pebble cell keys
+// with minimal allocations. After warmup (one key per unique row-key
+// length), Decode incurs zero heap allocations per call.
+type CellDecoder struct {
+	rowKeyBuf    []byte
+	qualifierBuf []byte
+}
+
+// Decode decodes a Pebble key into its Bigtable components. The returned
+// rowKey slice points into the original key and is only valid until the
+// next iterator positioning operation. The qualifier is a copy into an
+// internal buffer. Callers that need qualifier after the next iterator
+// operation must copy it.
+func (d *CellDecoder) Decode(key []byte) (rowKey []byte, family string, qualifier []byte, timestampMicros int64, ok bool) {
+	// Scan for row terminator (0x00 0x00) and count escapes.
 	pos := 0
+	esc := 0
 	for {
 		if pos >= len(key) {
-			return nil, "", nil, 0, false
+			return
 		}
 		if key[pos] != 0x00 {
-			rowBytes = append(rowBytes, key[pos])
 			pos++
 			continue
 		}
-		// key[pos] == 0x00
 		if pos+1 >= len(key) {
-			return nil, "", nil, 0, false
+			return
 		}
 		if key[pos+1] == 0xFF {
-			rowBytes = append(rowBytes, 0x00)
+			esc++
 			pos += 2
 			continue
 		}
 		if key[pos+1] == 0x00 {
-			pos += 2 // past terminator
 			break
 		}
-		return nil, "", nil, 0, false
+		return
 	}
-	rowKey = rowBytes
+	rowLen := pos
+	pos += 2
+
+	if esc > 0 {
+		d.rowKeyBuf = append(d.rowKeyBuf[:0], make([]byte, rowLen-esc)...)
+		dst := 0
+		for src := 0; src < rowLen; src++ {
+			if src+1 < rowLen && key[src] == 0x00 && key[src+1] == 0xFF {
+				d.rowKeyBuf[dst] = 0x00
+				src++
+			} else {
+				d.rowKeyBuf[dst] = key[src]
+			}
+			dst++
+		}
+		rowKey = d.rowKeyBuf
+	} else {
+		rowKey = key[:rowLen]
+	}
 
 	// Parse family name.
-	if pos >= len(key) || key[pos] == 0x00 {
-		return nil, "", nil, 0, false
+	if pos >= len(key) {
+		return
 	}
 	famLen := int(key[pos])
 	pos++
 	if pos+famLen >= len(key) || key[pos+famLen] != 0x00 {
-		return nil, "", nil, 0, false
+		return
 	}
-	if famLen > 0 {
-		family = string(key[pos : pos+famLen])
-	}
-	pos += famLen + 1 // skip family + sentinel
+	family = string(key[pos : pos+famLen])
+	pos += famLen + 1
 
-	// Parse qualifier.
+	// Parse qualifier (copied into reusable buffer).
 	if pos+2 > len(key) {
-		return nil, "", nil, 0, false
+		return
 	}
 	qualLen := int(binary.BigEndian.Uint16(key[pos:]))
 	pos += 2
 	if pos+qualLen >= len(key) || key[pos+qualLen] != 0x00 {
-		return nil, "", nil, 0, false
+		return
 	}
-	qualifier = make([]byte, qualLen)
-	copy(qualifier, key[pos:pos+qualLen])
-	pos += qualLen + 1 // skip qualifier + sentinel
+	d.qualifierBuf = append(d.qualifierBuf[:0], key[pos:pos+qualLen]...)
+	qualifier = d.qualifierBuf
+	pos += qualLen + 1
 
 	// Parse inverted timestamp.
 	if pos+8 != len(key) {
-		return nil, "", nil, 0, false
+		return
 	}
 	invTS := binary.BigEndian.Uint64(key[pos:])
 	timestampMicros = timestampFromInverted(invTS)
 
-	return rowKey, family, qualifier, timestampMicros, true
+	ok = true
+	return
+}
+
+// DecodeCellKey decodes a Pebble key back into its Bigtable components.
+// Returns false if the key format is invalid. The returned rowKey and
+// qualifier slices are freshly allocated copies safe to retain.
+//
+// For hot-path use, prefer CellDecoder.Decode for zero-alloc decoding.
+func DecodeCellKey(key []byte) (rowKey []byte, family string, qualifier []byte, timestampMicros int64, ok bool) {
+	// Scan for row terminator (0x00 0x00) and count escapes.
+	pos := 0
+	esc := 0
+	for {
+		if pos >= len(key) {
+			return
+		}
+		if key[pos] != 0x00 {
+			pos++
+			continue
+		}
+		if pos+1 >= len(key) {
+			return
+		}
+		if key[pos+1] == 0xFF {
+			esc++
+			pos += 2
+			continue
+		}
+		if key[pos+1] == 0x00 {
+			break
+		}
+		return
+	}
+	rowLen := pos
+	pos += 2
+
+	if esc > 0 {
+		rowKey = make([]byte, rowLen-esc)
+		dst := 0
+		for src := 0; src < rowLen; src++ {
+			if src+1 < rowLen && key[src] == 0x00 && key[src+1] == 0xFF {
+				rowKey[dst] = 0x00
+				src++
+			} else {
+				rowKey[dst] = key[src]
+			}
+			dst++
+		}
+	} else {
+		rowKey = append([]byte(nil), key[:rowLen]...)
+	}
+
+	// Parse family name.
+	if pos >= len(key) {
+		return
+	}
+	famLen := int(key[pos])
+	pos++
+	if pos+famLen >= len(key) || key[pos+famLen] != 0x00 {
+		return
+	}
+	family = string(key[pos : pos+famLen])
+	pos += famLen + 1
+
+	// Parse qualifier.
+	if pos+2 > len(key) {
+		return
+	}
+	qualLen := int(binary.BigEndian.Uint16(key[pos:]))
+	pos += 2
+	if pos+qualLen >= len(key) || key[pos+qualLen] != 0x00 {
+		return
+	}
+	qualifier = make([]byte, qualLen)
+	copy(qualifier, key[pos:pos+qualLen])
+	pos += qualLen + 1
+
+	// Parse inverted timestamp.
+	if pos+8 != len(key) {
+		return
+	}
+	invTS := binary.BigEndian.Uint64(key[pos:])
+	timestampMicros = timestampFromInverted(invTS)
+
+	ok = true
+	return
 }
 
 // rowEndKey returns the exclusive end key for a row prefix used by DeleteRange.

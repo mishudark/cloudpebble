@@ -110,6 +110,9 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 		return stream.Send(resp)
 	}
 
+	var dec CellDecoder
+	var valBuf []byte
+
 	for _, kr := range scanRanges {
 		iter, err := db.NewIter(&pebble.IterOptions{
 			LowerBound: kr.Start,
@@ -124,7 +127,7 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 		var rowStarted bool
 
 		for ; iter.Valid(); cfg.next(iter) {
-			rk, family, qualifier, ts, ok := DecodeCellKey(iter.Key())
+			rk, family, qualifier, ts, ok := dec.Decode(iter.Key())
 			if !ok {
 				continue
 			}
@@ -132,7 +135,6 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 			// Check row boundary.
 			if !bytes.Equal(rk, lastRowKey) {
 				if rowStarted {
-					// Close the previous row.
 					commitLastChunk()
 					lastScannedRowKey = append([]byte(nil), lastRowKey...)
 				}
@@ -140,7 +142,6 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 				if rowsLimit > 0 && rowCount > rowsLimit {
 					break
 				}
-				// Reset per-row filter state for the new row.
 				if filterEngine != nil {
 					filterEngine.eval.reset()
 				}
@@ -150,20 +151,18 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 
 			val := iter.Value()
 			if len(val) > 0 {
-				val = append([]byte(nil), val...)
+				valBuf = append(valBuf[:0], val...)
+				val = valBuf
 			}
 
-			// Apply filter.
 			if filterEngine != nil && !filterEngine.matchesCell(rk, family, qualifier, ts, val) {
 				continue
 			}
 
-			// Strip value if the filter chain includes a strip-value transformer.
 			if filterEngine != nil && filterEngine.hasStripValue() {
 				val = nil
 			}
 
-			// Emit cell chunk(s) — split large values across multiple chunks.
 			chunkBuf = appendCellChunks(chunkBuf, rk, family, qualifier, ts, val)
 
 			if len(chunkBuf) >= cellChunkBufferSize {
@@ -265,7 +264,9 @@ func cellChunk(rowKey []byte, family string, qualifier []byte, timestampMicros i
 		chunk.FamilyName = wrapperspb.String(family)
 	}
 	if len(qualifier) > 0 {
-		chunk.Qualifier = wrapperspb.Bytes(qualifier)
+		q := make([]byte, len(qualifier))
+		copy(q, qualifier)
+		chunk.Qualifier = wrapperspb.Bytes(q)
 	}
 	return chunk
 }

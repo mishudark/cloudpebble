@@ -622,7 +622,7 @@ func testReadRowsCellsPerRowLimitMultiRow(ctx context.Context, tbl *bigtable.Tab
 	// Read with CellsPerRowLimit(1) — should get exactly 1 cell per row.
 	var totalCells int
 	seenRows := make(map[string]bool)
-	err := tbl.ReadRows(ctx, bigtable.RowRange{},
+	err := tbl.ReadRows(ctx, bigtable.PrefixRange("cpr"),
 		func(r bigtable.Row) bool {
 			seenRows[r.Key()] = true
 			for _, items := range r {
@@ -630,7 +630,6 @@ func testReadRowsCellsPerRowLimitMultiRow(ctx context.Context, tbl *bigtable.Tab
 			}
 			return true
 		},
-		bigtable.LimitRows(2),           // read at most 2 rows
 		bigtable.RowFilter(bigtable.CellsPerRowLimitFilter(1)),  // 1 cell per row
 	)
 	if err != nil {
@@ -664,7 +663,7 @@ func testReadRowsCellsPerRowOffsetMultiRow(ctx context.Context, tbl *bigtable.Ta
 	// Read with CellsPerRowOffsetFilter(1) — skips first cell, returns 2 per row.
 	var totalCells int
 	seenRows := make(map[string]bool)
-	err := tbl.ReadRows(ctx, bigtable.RowRange{},
+	err := tbl.ReadRows(ctx, bigtable.PrefixRange("cpo"),
 		func(r bigtable.Row) bool {
 			seenRows[r.Key()] = true
 			for _, items := range r {
@@ -672,7 +671,6 @@ func testReadRowsCellsPerRowOffsetMultiRow(ctx context.Context, tbl *bigtable.Ta
 			}
 			return true
 		},
-		bigtable.LimitRows(2),
 		bigtable.RowFilter(bigtable.CellsPerRowOffsetFilter(1)),
 	)
 	if err != nil {
