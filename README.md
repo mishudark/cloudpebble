@@ -16,6 +16,7 @@ A local Pebble instance serves as a read-optimized NVMe/SSD cache. All writes ar
 - **OpenTelemetry-native metrics.** Counters and latency histograms registered as OTEL observable instruments — no Prometheus bridge needed.
 - **Namespace isolation.** Each tenant gets its own prefix in object storage with independent Pebble DB, checkpoints, and WAL sequences. No cross-tenant data mixing.
 - **Crash recovery with cold-miss self-healing.** Nodes restart from object-storage checkpoints and replay uncommitted WALs. A cold-miss detector triggers background recovery if consecutive cache misses suggest stale or missing local data.
+- **Async WAL mode for persistent SSD.** An optional inverted write path: writes are fsync'd to a local WAL file on SSD and acknowledged immediately. The object-storage upload happens asynchronously in the background. On crash, local WAL files are replayed — zero data loss if the SSD survives.
 
 ```
                         ╔═══════════ cloudpebble ═══════════════════╗
@@ -42,7 +43,8 @@ Every write creates an immutable WAL object in object storage. Once the WAL is d
               └──────────┬───────────┘
                          │
               ┌──────────▼───────────┐
-              │  Write to GCS WAL    │  ── durability barrier (~100ms)
+              │  Write WAL to object │  ── durability barrier (~100ms)
+              │  storage             │
               │  {ns}/wal/{seq}.wal  │
               └──────────┬───────────┘
                          │
@@ -52,9 +54,54 @@ Every write creates an immutable WAL object in object storage. Once the WAL is d
               └──────────┬───────────┘
                          │
               ┌──────────▼───────────┐
-              │  Return success      │
+              │  Acknowledge write   │
               └──────────────────────┘
 ```
+
+### Write Path (Async WAL)
+
+When `AsyncWAL` is enabled, writes are fsync'd to a local WAL file on
+persistent SSD first, applied to the in-memory memtable, and acknowledged
+immediately. The WAL upload to object storage happens asynchronously in
+the background via the batch window.
+
+```
+                    Set(key, value)
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │  Encode Pebble batch │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │  Write local WAL     │  ── fsync to SSD (~µs)
+              │  localwal/{seq}.wal  │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │  Apply to local      │
+              │  Pebble memtable     │  ── in-memory (~µs)
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼───────────┐
+              │  Acknowledge write   │  ── data safe on SSD
+              └──────────────────────┘
+                         │  ... background ...
+                         ▼
+              ┌──────────────────────┐
+              │  Upload WAL to       │  ── async via batch window
+              │  object storage      │
+              └──────────┬───────────┘
+                         │ on success:
+                         ▼
+              ┌──────────────────────┐
+              │  Delete local WAL    │
+              └──────────────────────┘
+```
+
+On crash recovery, local WAL files are replayed on top of the
+object-storage checkpoint, so no data is lost — provided the local SSD
+survives the crash (not safe on ephemeral storage like Cloud Run).
 
 When batching is enabled (`BatchWindow > 0`, default 200ms), concurrent writes within the same window are coalesced into a single GCS WAL object.
 
@@ -262,7 +309,11 @@ Row keys use null-escape encoding (`0x00` → `0x00 0xFF`) with a `0x00 0x00` te
 ### Running the Bigtable Server
 
 ```bash
+# Strong consistency (WAL → object storage first, then acknowledge)
 go run ./cmd/pebble-bigtable/ --addr :9000 --data-dir /tmp/btdb --object-dir /tmp/btobj
+
+# Async WAL (local SSD first, acknowledge immediately, async object-storage upload)
+go run ./cmd/pebble-bigtable/ --addr :9000 --async-wal --data-dir /tmp/btdb --object-dir /tmp/btobj
 ```
 
 ### Using with a Bigtable Client
@@ -390,6 +441,7 @@ e, _ := engine.Open(engine.Options{
 | `BatchWindow` | `200ms` | WAL batching window (negative = disabled) |
 | `ColdMissThreshold` | `3` | Consecutive misses before triggering recovery |
 | `Consistency` | `Strong` | `Strong` or `Eventual` |
+| `AsyncWAL` | `false` | Fsync to local WAL on SSD first, acknowledge immediately, upload to object storage asynchronously. Safe only on persistent SSD. |
 | `OrphanWALTTL` | `1h` | Delete orphan WAL objects older than this |
 | `MaxLocalBytes` | `0` (unlimited) | Soft limit on local Pebble cache size |
 | `PebbleOptions` | defaults | Passed through to `pebble.Open()` |

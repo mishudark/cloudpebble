@@ -19,6 +19,7 @@ func main() {
 	addr := flag.String("addr", ":9000", "gRPC listen address")
 	dataDir := flag.String("data-dir", "/tmp/cloudpebble-bigtable", "local data directory")
 	objectDir := flag.String("object-dir", "/tmp/cloudpebble-bigtable-obj", "object storage directory")
+	asyncWAL := flag.Bool("async-wal", false, "apply writes locally first, upload WAL asynchronously (safe on persistent SSD only)")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dataDir, 0750); err != nil {
@@ -34,6 +35,9 @@ func main() {
 	}
 
 	srv := bigtable.NewServer(*dataDir, store)
+	if *asyncWAL {
+		srv.SetAsyncWAL(true)
+	}
 
 	grpcServer := grpc.NewServer()
 	bigtablepb.RegisterBigtableServer(grpcServer, srv)

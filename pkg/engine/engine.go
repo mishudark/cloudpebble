@@ -32,6 +32,7 @@ const (
 	dataDir                  = "data"
 	ckptDir                  = "checkpoint"
 	manifestsDir             = "manifests"
+	localWALDir              = "localwal"
 	maxManifestHistory       = 10
 )
 
@@ -83,6 +84,20 @@ type Options struct {
 	// Consistency sets the read consistency level. Default: ConsistencyStrong.
 	Consistency ConsistencyLevel
 
+	// AsyncWAL inverts the write path: apply to local Pebble first, acknowledge
+	// immediately, and upload the WAL to object storage asynchronously in the
+	// background. Useful on persistent SSD where local durability is sufficient
+	// and write latency matters more than immediate object-storage durability.
+	//
+	// On crash before the WAL upload completes, acknowledged writes survive in
+	// the local Pebble instance on persistent disk — they are not lost. However,
+	// cold-start recovery from object storage alone will miss those writes until
+	// the next Sync uploads a checkpoint covering them.
+	//
+	// NOT safe on ephemeral storage (Cloud Run, spot instances) where the local
+	// Pebble directory is wiped on restart — un-uploaded WAL data is lost.
+	AsyncWAL bool
+
 	// OrphanWALTTL is the duration after which WAL objects with sequence
 	// numbers that have not been applied locally are deleted as orphans.
 	// Zero disables orphan cleanup. Default: 1 hour.
@@ -118,6 +133,7 @@ type Engine struct {
 	logger   *slog.Logger
 
 	consistency ConsistencyLevel
+	asyncWAL    bool
 
 	dbMu sync.RWMutex
 	db   *pebble.DB
@@ -201,6 +217,7 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 		localDir:       opts.Dir,
 		logger:         opts.Logger,
 		consistency:    opts.Consistency,
+		asyncWAL:       opts.AsyncWAL,
 		orphanWALTTL:   opts.OrphanWALTTL,
 		batchWindow:    opts.BatchWindow,
 		maxLocalBytes:  opts.MaxLocalBytes,
@@ -235,8 +252,14 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 }
 
 // recover downloads checkpoint data from object storage (if any) and
-// replays uncommitted WAL entries. It opens Pebble with the recovered
-// state. Called both at Open() and during cold-miss recovery.
+// replays WAL entries — both remote (object storage) and local (SSD).
+// It opens Pebble with the recovered state.
+//
+// When AsyncWAL is enabled, local WAL files in {localDir}/localwal/ are
+// replayed after the object-storage checkpoint and remote WALs. These files
+// represent writes that were fsync'd to local SSD and acknowledged before
+// their object-storage upload completed. After replay, local WAL files are
+// deleted.
 func (e *Engine) recover(ctx context.Context) error {
 	manifestBytes, err := e.store.Get(ctx, e.manifestPath())
 	hasManifest := err == nil
@@ -289,10 +312,16 @@ func (e *Engine) recover(ctx context.Context) error {
 	e.db = db
 	e.dbMu.Unlock()
 
+	// Replay remote WALs (uploaded to object storage but not yet checkpointed).
 	if e.consistency == ConsistencyStrong {
 		if err := e.replayWALs(ctx); err != nil {
 			return fmt.Errorf("replaying WALs: %w", err)
 		}
+	}
+
+	// Replay local WAL files (fsync'd to SSD, not yet uploaded to object storage).
+	if err := e.replayLocalWALs(ctx); err != nil {
+		return fmt.Errorf("replaying local WALs: %w", err)
 	}
 
 	return nil
@@ -361,6 +390,10 @@ func (e *Engine) walReplayLoop() {
 func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uint64, error) {
 	data := batch.Repr()
 
+	if e.asyncWAL {
+		return e.applyThenWALAsync(ctx, batch, data)
+	}
+
 	walStart := time.Now()
 	seq, done, err := e.walMgr.WriteRecord(ctx, data)
 	e.metrics.WALWriteLatencyNs.Add(time.Since(walStart).Nanoseconds())
@@ -397,6 +430,95 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 	}
 	e.mu.Unlock()
 	return seq, nil
+}
+
+// applyThenWALAsync writes the batch data to a local WAL file on SSD first
+// (fsync'd for crash durability), applies it to the in-memory Pebble memtable,
+// and returns immediately. The WAL is uploaded to object storage asynchronously
+// in the background. Once uploaded, the local WAL file is deleted.
+//
+// On recovery, local WAL files are replayed after the object-storage checkpoint
+// and remote WALs, then deleted.
+func (e *Engine) applyThenWALAsync(ctx context.Context, batch *pebble.Batch, data []byte) (uint64, error) {
+	// Allocate a sequence number and register the WAL for object-storage upload.
+	// Returns immediately when batching; synchronous for direct writes.
+	seq, done, err := e.walMgr.WriteRecord(ctx, data)
+	e.metrics.WALObjectsWritten.Add(1)
+	e.metrics.BytesWrittenWAL.Add(int64(len(data)))
+	if err != nil {
+		return 0, fmt.Errorf("engine: registering WAL: %w", err)
+	}
+
+	// Write the WAL to local SSD with fsync — this is the durability barrier.
+	localPath := e.localWALPath(seq)
+	if mkErr := os.MkdirAll(filepath.Dir(localPath), 0750); mkErr != nil {
+		return 0, fmt.Errorf("engine: creating local WAL dir: %w", mkErr)
+	}
+	if wrErr := writeFileSync(localPath, data, 0600); wrErr != nil {
+		return 0, fmt.Errorf("engine: writing local WAL: %w", wrErr)
+	}
+
+	// Apply to the in-memory Pebble memtable (fast, no disk I/O).
+	applyStart := time.Now()
+	e.dbMu.RLock()
+	err = e.db.Apply(batch, pebble.NoSync)
+	e.dbMu.RUnlock()
+	e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
+	if err != nil {
+		e.logger.Error("local apply failed", "seq", seq, "error", err)
+		return 0, fmt.Errorf("engine: applying: %w", err)
+	}
+
+	e.mu.Lock()
+	if seq > e.maxWALSeq {
+		e.maxWALSeq = seq
+	}
+	e.mu.Unlock()
+
+	// Background: once the WAL is durably in object storage, delete the local copy.
+	if done != nil {
+		e.wg.Go(func() {
+			select {
+			case gcsErr := <-done:
+				if gcsErr != nil {
+					e.logger.Error("async WAL upload failed", "seq", seq, "error", gcsErr)
+					e.metrics.AsyncWALFailures.Add(1)
+					select {
+					case e.errCh <- fmt.Errorf("async WAL seq %d: %w", seq, gcsErr):
+					default:
+					}
+					return
+				}
+				_ = os.Remove(localPath)
+			case <-e.ctx.Done():
+			}
+		})
+	} else {
+		_ = os.Remove(localPath)
+	}
+
+	return seq, nil
+}
+
+func (e *Engine) localWALPath(seq uint64) string {
+	return filepath.Join(e.localDir, localWALDir, fmt.Sprintf("%020d.wal", seq))
+}
+
+// writeFileSync writes data to a file and fsyncs it to disk.
+func writeFileSync(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) //nolint:gosec // path is engine-internal
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // Set stores a key-value pair. The write is durably committed to object
@@ -760,6 +882,42 @@ func (e *Engine) manifestVersionsPrefix() string {
 
 func (e *Engine) dataPrefix() string {
 	return filepath.ToSlash(filepath.Join(e.ns, dataDir)) + "/"
+}
+
+// replayLocalWALs replays any local WAL files from {localDir}/localwal/ into
+// Pebble and deletes them. These represent writes that were fsync'd to local
+// SSD and acknowledged but not yet uploaded to object storage.
+func (e *Engine) replayLocalWALs(ctx context.Context) error {
+	localWALSub := filepath.Join(e.localDir, localWALDir)
+	entries, err := os.ReadDir(localWALSub)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		localPath := filepath.Join(localWALSub, entry.Name())
+		data, err := os.ReadFile(filepath.Clean(localPath)) //nolint:gosec // path from controlled local dir
+		if err != nil {
+			return fmt.Errorf("reading local WAL %s: %w", entry.Name(), err)
+		}
+		batch := e.db.NewBatch()
+		if err := batch.SetRepr(data); err != nil {
+			_ = batch.Close()
+			return fmt.Errorf("setting local WAL repr %s: %w", entry.Name(), err)
+		}
+		if err := e.db.Apply(batch, pebble.NoSync); err != nil {
+			_ = batch.Close()
+			return fmt.Errorf("replaying local WAL %s: %w", entry.Name(), err)
+		}
+		_ = batch.Close()
+		_ = os.Remove(localPath)
+	}
+	return nil
 }
 
 // Close gracefully shuts down the engine, flushing data and uploading a final

@@ -241,6 +241,7 @@ Server flags:
 | `--addr` | `:9000` | gRPC listen address |
 | `--data-dir` | `/tmp/cloudpebble-bigtable` | Local Pebble data directory |
 | `--object-dir` | `/tmp/cloudpebble-bigtable-obj` | Object storage directory |
+| `--async-wal` | `false` | Apply writes locally first, upload WAL to object storage asynchronously |
 
 Engine options available programmatically via `engine.Options` (for embedded use):
 

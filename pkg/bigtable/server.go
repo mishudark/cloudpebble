@@ -49,6 +49,16 @@ func NewServer(dir string, store objstore.Store) *Server {
 	}
 }
 
+// SetAsyncWAL enables or disables the async WAL write mode on all tables
+// opened by this server. When enabled, writes are applied to the local Pebble
+// instance first and acknowledged immediately; the WAL upload to object
+// storage happens asynchronously in the background.
+func (s *Server) SetAsyncWAL(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.engineOverrides.AsyncWAL = v
+}
+
 // Close shuts down the server, closing all open engines.
 func (s *Server) Close() error {
 	s.mu.Lock()
@@ -95,6 +105,9 @@ func (s *Server) getEngine(ctx context.Context, tableName string) (*engine.Engin
 	}
 	if s.engineOverrides.BatchWindow != 0 {
 		opts.BatchWindow = s.engineOverrides.BatchWindow
+	}
+	if s.engineOverrides.AsyncWAL {
+		opts.AsyncWAL = true
 	}
 	eng, err := engine.Open(ctx, opts)
 	if err != nil {
