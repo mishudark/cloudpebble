@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/pebble"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mishudark/cloudpebble/pkg/objstore"
 	"github.com/mishudark/cloudpebble/pkg/walcloud"
@@ -34,6 +35,8 @@ const (
 	manifestsDir             = "manifests"
 	localWALDir              = "localwal"
 	maxManifestHistory       = 10
+	parallelDownloads        = 8 // concurrent SST downloads during recovery
+	parallelUploads          = 8 // concurrent SST uploads during Sync
 )
 
 // ConsistencyLevel controls the consistency guarantee on reads.
@@ -281,21 +284,29 @@ func (e *Engine) recover(ctx context.Context) error {
 
 		e.manifestVersion = m.Version
 
+		// Download checkpoint files concurrently to reduce cold-start latency.
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(parallelDownloads)
 		for _, mf := range m.Files {
-			remotePath := filepath.ToSlash(filepath.Join(e.dataPrefix(), mf.Name))
-			localPath := filepath.Join(e.localDir, mf.Name)
-			var data []byte
-			data, err = e.store.Get(ctx, remotePath)
-			if err != nil {
-				return fmt.Errorf("downloading %s: %w", remotePath, err)
-			}
-			err = os.WriteFile(localPath, data, 0600)
-			if err != nil {
-				return fmt.Errorf("writing local %s: %w", localPath, err)
-			}
-			e.uploadedMu.Lock()
-			e.uploadedFiles[remotePath] = struct{}{}
-			e.uploadedMu.Unlock()
+			mf := mf
+			g.Go(func() error {
+				remotePath := filepath.ToSlash(filepath.Join(e.dataPrefix(), mf.Name))
+				localPath := filepath.Join(e.localDir, mf.Name)
+				data, gErr := e.store.Get(gctx, remotePath)
+				if gErr != nil {
+					return fmt.Errorf("downloading %s: %w", remotePath, gErr)
+				}
+				if gErr = os.WriteFile(localPath, data, 0600); gErr != nil {
+					return fmt.Errorf("writing local %s: %w", localPath, gErr)
+				}
+				e.uploadedMu.Lock()
+				e.uploadedFiles[remotePath] = struct{}{}
+				e.uploadedMu.Unlock()
+				return nil
+			})
+		}
+		if err = g.Wait(); err != nil {
+			return err
 		}
 
 		e.maxWALSeq = m.MaxWALSeq
@@ -408,25 +419,49 @@ func (e *Engine) writeWALAndApply(ctx context.Context, batch *pebble.Batch) (uin
 	e.metrics.WALObjectsWritten.Add(1)
 	e.metrics.BytesWrittenWAL.Add(int64(len(data)))
 
+	// When batching is enabled (done != nil), the WAL upload runs asynchronously.
+	// Overlap the local Pebble apply with the GCS upload to hide apply latency
+	// behind the network round-trip. This is safe because WriteRecord copies the
+	// data in the batching path, so db.Apply can modify the batch repr without
+	// affecting the in-flight upload.
 	if done != nil {
+		applyErrCh := make(chan error, 1)
+		applyStart := time.Now()
+		go func() {
+			e.dbMu.RLock()
+			aErr := e.db.Apply(batch, pebble.NoSync)
+			e.dbMu.RUnlock()
+			e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
+			applyErrCh <- aErr
+		}()
+
 		select {
 		case gcsErr := <-done:
 			if gcsErr != nil {
+				<-applyErrCh
 				return 0, fmt.Errorf("engine: WAL durability: %w", gcsErr)
 			}
 		case <-ctx.Done():
+			<-applyErrCh
 			return 0, ctx.Err()
 		}
-	}
 
-	applyStart := time.Now()
-	e.dbMu.RLock()
-	err = e.db.Apply(batch, pebble.NoSync)
-	e.dbMu.RUnlock()
-	e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
-	if err != nil {
-		e.logger.Warn("local apply failed after durable WAL commit", "seq", seq, "error", err)
-		return 0, fmt.Errorf("engine: applying: %w", err)
+		err = <-applyErrCh
+		if err != nil {
+			e.logger.Warn("local apply failed after durable WAL commit", "seq", seq, "error", err)
+			return 0, fmt.Errorf("engine: applying: %w", err)
+		}
+	} else {
+		// Non-batching path: WAL is already durable, apply locally.
+		applyStart := time.Now()
+		e.dbMu.RLock()
+		err = e.db.Apply(batch, pebble.NoSync)
+		e.dbMu.RUnlock()
+		e.metrics.ApplyLatencyNs.Add(time.Since(applyStart).Nanoseconds())
+		if err != nil {
+			e.logger.Warn("local apply failed after durable WAL commit", "seq", seq, "error", err)
+			return 0, fmt.Errorf("engine: applying: %w", err)
+		}
 	}
 
 	e.mu.Lock()
@@ -744,8 +779,20 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 	e.uploadedFiles = make(map[string]struct{}, len(entries))
 	e.uploadedMu.Unlock()
 
+	// First pass: read all checkpoint files, compute checksums, build manifest
+	// entries, and identify files that need uploading. Reading + hashing is
+	// local I/O (fast); the bottleneck is the GCS uploads handled in the second
+	// pass. Reading each file once (instead of twice) also eliminates the
+	// redundant read for manifest checksum computation.
 	checkpointFiles := make(map[string]bool, len(entries))
 	manifestFiles := make([]ManifestFile, 0, len(entries))
+	type uploadTask struct {
+		remotePath string
+		name       string
+		data       []byte
+	}
+	var uploads []uploadTask
+
 	for _, entry := range entries {
 		checkpointFiles[entry.Name()] = true
 		name := entry.Name()
@@ -758,12 +805,11 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 		}
 
 		h := sha256.Sum256(data)
-		mf := ManifestFile{
+		manifestFiles = append(manifestFiles, ManifestFile{
 			Name:     name,
 			Size:     int64(len(data)),
 			Checksum: hex.EncodeToString(h[:]),
-		}
-		manifestFiles = append(manifestFiles, mf)
+		})
 
 		// Incremental: skip upload for non-mutable files already in storage.
 		_, alreadyUploaded := prevFiles[remotePath]
@@ -774,12 +820,29 @@ func (e *Engine) Sync(ctx context.Context) (err error) {
 			continue
 		}
 
-		if err = e.store.Put(ctx, remotePath, data); err != nil {
-			return fmt.Errorf("engine: uploading %s: %w", name, err)
-		}
+		uploads = append(uploads, uploadTask{remotePath: remotePath, name: name, data: data})
+	}
 
+	// Second pass: upload files concurrently to amortize GCS round-trip latency.
+	if len(uploads) > 0 {
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(parallelUploads)
+		for _, task := range uploads {
+			task := task
+			g.Go(func() error {
+				if gErr := e.store.Put(gctx, task.remotePath, task.data); gErr != nil {
+					return fmt.Errorf("engine: uploading %s: %w", task.name, gErr)
+				}
+				return nil
+			})
+		}
+		if err = g.Wait(); err != nil {
+			return err
+		}
 		e.uploadedMu.Lock()
-		e.uploadedFiles[remotePath] = struct{}{}
+		for _, task := range uploads {
+			e.uploadedFiles[task.remotePath] = struct{}{}
+		}
 		e.uploadedMu.Unlock()
 	}
 
