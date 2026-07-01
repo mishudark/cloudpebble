@@ -36,8 +36,16 @@ type Server struct {
 }
 
 type tableState struct {
-	engine *engine.Engine
-	rowLocks sync.Map // map[string]*sync.Mutex — per-row locks for CheckAndMutateRow
+	engine   *engine.Engine
+	rowMu    sync.Mutex
+	rowLocks map[string]*rowLockEntry // per-row locks for CheckAndMutateRow
+}
+
+// rowLockEntry is a per-row mutex with a waiter count so the map entry
+// can be cleaned up when no goroutine is using it.
+type rowLockEntry struct {
+	mu      sync.Mutex
+	waiters int
 }
 
 // NewServer creates a new Bigtable server.
@@ -117,7 +125,7 @@ func (s *Server) getEngine(ctx context.Context, tableName string) (*engine.Engin
 		return nil, fmt.Errorf("opening table %q: %w", tableName, err)
 	}
 
-	s.tables[tableName] = &tableState{engine: eng}
+	s.tables[tableName] = &tableState{engine: eng, rowLocks: make(map[string]*rowLockEntry)}
 	return eng, nil
 }
 

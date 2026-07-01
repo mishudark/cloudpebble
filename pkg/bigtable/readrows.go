@@ -111,7 +111,6 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 	}
 
 	var dec CellDecoder
-	var valBuf []byte
 
 	for _, kr := range scanRanges {
 		iter, err := db.NewIter(&pebble.IterOptions{
@@ -150,10 +149,6 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 			}
 
 			val := iter.Value()
-			if len(val) > 0 {
-				valBuf = append(valBuf[:0], val...)
-				val = valBuf
-			}
 
 			if filterEngine != nil && !filterEngine.matchesCell(rk, family, qualifier, ts, val) {
 				continue
@@ -229,8 +224,11 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 			chunk = cellChunk(rowKey, family, qualifier, timestampMicros, value[offset:end], nil)
 		} else {
 			// Continuation chunks carry only value (and optional value_size).
+			// Copy the slice to avoid referencing the iterator's internal buffer.
+			cv := make([]byte, end-offset)
+			copy(cv, value[offset:end])
 			chunk = &bigtablepb.ReadRowsResponse_CellChunk{
-				Value: value[offset:end],
+				Value: cv,
 			}
 		}
 		if end < totalSize {

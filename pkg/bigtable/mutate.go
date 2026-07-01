@@ -3,7 +3,6 @@ package bigtable
 import (
 	"context"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
@@ -156,12 +155,28 @@ func (s *Server) CheckAndMutateRow(ctx context.Context, req *bigtablepb.CheckAnd
 
 	// Acquire per-row lock to ensure atomicity of predicate evaluation and
 	// mutation apply. This prevents two concurrent CheckAndMutateRow calls
-	// on the same row from racing on the predicate check.
+	// on the same row from racing on the predicate check. The entry is
+	// cleaned up when the last waiter releases the lock.
 	rowKeyStr := string(rowKey)
-	rowLockI, _ := ts.rowLocks.LoadOrStore(rowKeyStr, &sync.Mutex{})
-	rowLock, _ := rowLockI.(*sync.Mutex)
-	rowLock.Lock()
-	defer rowLock.Unlock()
+	ts.rowMu.Lock()
+	entry, ok := ts.rowLocks[rowKeyStr]
+	if !ok {
+		entry = &rowLockEntry{}
+		ts.rowLocks[rowKeyStr] = entry
+	}
+	entry.waiters++
+	ts.rowMu.Unlock()
+
+	entry.mu.Lock()
+	defer func() {
+		entry.mu.Unlock()
+		ts.rowMu.Lock()
+		entry.waiters--
+		if entry.waiters == 0 {
+			delete(ts.rowLocks, rowKeyStr)
+		}
+		ts.rowMu.Unlock()
+	}()
 
 	db := eng.DB()
 	predicateFilter := req.GetPredicateFilter()
@@ -219,8 +234,9 @@ func rowHasCells(db *pebble.DB, rowKey []byte, filter *bigtablepb.RowFilter) boo
 
 // applyMutationsToBatch applies a list of Bigtable mutations to a Pebble batch.
 func applyMutationsToBatch(batch *pebble.Batch, rowKey []byte, mutations []*bigtablepb.Mutation) error {
+	nowMicros := time.Now().UnixMicro()
 	for _, mut := range mutations {
-		if err := applyMutationToBatch(batch, rowKey, mut); err != nil {
+		if err := applyMutationToBatch(batch, rowKey, mut, nowMicros); err != nil {
 			return err
 		}
 	}
@@ -228,13 +244,13 @@ func applyMutationsToBatch(batch *pebble.Batch, rowKey []byte, mutations []*bigt
 }
 
 // applyMutationToBatch applies a single Bigtable mutation to a Pebble batch.
-func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mutation) error {
+func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mutation, nowMicros int64) error {
 	switch m := mut.Mutation.(type) {
 	case *bigtablepb.Mutation_SetCell_:
-		return applySetCell(batch, rowKey, m.SetCell)
+		return applySetCell(batch, rowKey, m.SetCell, nowMicros)
 
 	case *bigtablepb.Mutation_DeleteFromColumn_:
-		return applyDeleteFromColumn(batch, rowKey, m.DeleteFromColumn)
+		return applyDeleteFromColumn(batch, rowKey, m.DeleteFromColumn, nowMicros)
 
 	case *bigtablepb.Mutation_DeleteFromFamily_:
 		return applyDeleteFromFamily(batch, rowKey, m.DeleteFromFamily)
@@ -253,7 +269,7 @@ func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mu
 	}
 }
 
-func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_SetCell) error {
+func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_SetCell, nowMicros int64) error {
 	if len(sc.GetFamilyName()) > math.MaxUint8 {
 		return status.Error(codes.InvalidArgument, "family name too long (max 255 bytes)")
 	}
@@ -262,13 +278,13 @@ func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_Se
 	}
 	ts := sc.GetTimestampMicros()
 	if ts == -1 {
-		ts = time.Now().UnixMicro()
+		ts = nowMicros
 	}
 	key := EncodeCellKey(rowKey, sc.GetFamilyName(), sc.GetColumnQualifier(), ts)
 	return batch.Set(key, sc.GetValue(), nil)
 }
 
-func applyDeleteFromColumn(batch *pebble.Batch, rowKey []byte, dc *bigtablepb.Mutation_DeleteFromColumn) error {
+func applyDeleteFromColumn(batch *pebble.Batch, rowKey []byte, dc *bigtablepb.Mutation_DeleteFromColumn, nowMicros int64) error {
 	rp := encodeRowPrefix(rowKey)
 	fp := encodeFamilyPrefix(rp, dc.GetFamilyName())
 	cp := encodeColumnPrefix(fp, dc.GetColumnQualifier())
@@ -278,7 +294,7 @@ func applyDeleteFromColumn(batch *pebble.Batch, rowKey []byte, dc *bigtablepb.Mu
 		startTS := tr.GetStartTimestampMicros()
 		endTS := tr.GetEndTimestampMicros()
 		if endTS == 0 {
-			endTS = time.Now().UnixMicro()
+			endTS = nowMicros
 		}
 		start, end := encodeTimestampRangeBounds(cp, startTS, endTS)
 		return batch.DeleteRange(start, end, nil)

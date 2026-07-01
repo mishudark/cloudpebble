@@ -9,7 +9,7 @@ A local Pebble instance serves as a read-optimized NVMe/SSD cache. All writes ar
 - **Sub-millisecond cached reads.** Reads hit a local Pebble LSM tree — no network roundtrip.
 - **Immediate read-your-writes.** Writes are applied to the local memtable after object-storage durability, so a single node sees its own writes instantly (strong consistency).
 - **Embedded or networked.** Use CloudPebble as an in-process Go library (`pkg/engine`), or deploy it as a Bigtable-compatible gRPC server (`cmd/pebble-bigtable`) accessible from any Bigtable v2 SDK. Same engine, two deployment modes.
-- **Incremental checkpoints.** Only new or changed SST files are uploaded to object storage. Unchanged files are skipped, minimizing egress costs and sync time.
+- **Incremental checkpoints with parallel uploads.** Only new or changed SST files are uploaded to object storage, and uploads run 8-way concurrent. Unchanged files are skipped, minimizing egress costs and sync time.
 - **WAL batching with configurable window.** Concurrent writes within the same window are coalesced into a single object-storage object, amortizing the ~100ms roundtrip across many writers. At 200ms batch window and 50k concurrent goroutines, extrapolated throughput exceeds 680k ops/sec.
 - **Production-grade Bigtable v2 API over object storage.** A gRPC server implementing MutateRow, ReadRows, CheckAndMutateRow, ReadModifyWriteRow, SampleRowKeys, and 16 RowFilter types — mapping Bigtable's wide-column model onto Pebble. Fully verified with the official `cloud.google.com/go/bigtable` client library across 33 integration tests + fuzz harness.
 - **Multi-backend object storage.** A minimal `Store` interface (Put/Get/Delete/List/Attrs) with GCS and local filesystem backends. Adding S3 or Azure Blob requires implementing a single interface.
@@ -162,7 +162,7 @@ A background goroutine periodically flushes memtables to local SSTs, uploads the
          │
          ▼
   ┌──────────────┐
-  │ Upload new    │      Incremental: only upload changed SSTs
+  │ Upload new    │      Incremental + parallel (8-way concurrent)
   │ SSTs to GCS   │
   └──────┬───────┘
          │
@@ -198,7 +198,7 @@ A background goroutine periodically flushes memtables to local SSTs, uploads the
        ▼      ▼
   ┌────────┐  ┌───────────────────┐
   │ Start  │  │ Download SSTs +    │
-  │ fresh  │  │ MANIFEST from GCS  │
+  │ fresh  │  │ MANIFEST from GCS  │  8-way parallel
   └───┬────┘  │ Verify checksums   │
       │       └────────┬──────────┘
       │                │
@@ -459,6 +459,8 @@ type Store interface {
     List(ctx context.Context, prefix string) ([]string, error)
     Exists(ctx context.Context, path string) (bool, error)
     Attrs(ctx context.Context, path string) (ObjectInfo, error)
+    PutReader(ctx context.Context, path string, r io.Reader, size int64) error
+    GetReader(ctx context.Context, path string) (io.ReadCloser, error)
 }
 ```
 
@@ -564,4 +566,6 @@ coalescing frequency, proportionally increasing batching throughput.
 
 - **No batching** is CPU-bound on `store.Put` at ~28-35k ops/sec regardless of concurrency — each write does synchronous file I/O after an atomic seq allocation.
 - **200ms batching** (current default) coalesces writes within each window. At 50k goroutines this yields ~682k ops/sec extrapolated.
-- **ReadRows** is allocation-heavy: 90k allocs per 10k-row scan comes from CellChunk construction per cell.
+- **ReadRows** allocs reduced via single-allocation `EncodeCellKey` and eliminated intermediate value copies.
+- **Parallel transfers** — Sync uploads and recovery downloads run 8-way concurrent, reducing cold-start latency by up to 8×.
+- **Overlapped apply** — in batching mode, local Pebble apply runs concurrently with the GCS WAL upload, hiding memtable insert latency behind the network round-trip.

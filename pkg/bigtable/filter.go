@@ -5,7 +5,6 @@ import (
 	"math/rand/v2"
 	"regexp"
 	"slices"
-	"strings"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
@@ -190,7 +189,7 @@ func buildInterleave(il *bigtablepb.RowFilter_Interleave) (*interleaveFilter, er
 		}
 		filters = append(filters, eval)
 	}
-	return &interleaveFilter{filters: filters}, nil
+	return &interleaveFilter{filters: filters, seen: make(map[cellIdentity]bool)}, nil
 }
 
 func (il *interleaveFilter) evaluate(cell cellInfo) bool {
@@ -211,7 +210,7 @@ func (il *interleaveFilter) evaluate(cell cellInfo) bool {
 }
 
 func (il *interleaveFilter) reset() {
-	il.seen = nil
+	il.seen = make(map[cellIdentity]bool)
 	for _, f := range il.filters {
 		f.reset()
 	}
@@ -352,7 +351,7 @@ func (c *columnRangeFilter) evaluate(cell cellInfo) bool {
 		return true
 	}
 	if len(c.startQualifier) > 0 {
-		cmp := strings.Compare(string(cell.qualifier), string(c.startQualifier))
+		cmp := bytes.Compare(cell.qualifier, c.startQualifier)
 		if c.startInclusive {
 			if cmp < 0 {
 				return false
@@ -364,7 +363,7 @@ func (c *columnRangeFilter) evaluate(cell cellInfo) bool {
 		}
 	}
 	if len(c.endQualifier) > 0 {
-		cmp := strings.Compare(string(cell.qualifier), string(c.endQualifier))
+		cmp := bytes.Compare(cell.qualifier, c.endQualifier)
 		if c.endInclusive {
 			if cmp > 0 {
 				return false
@@ -437,19 +436,24 @@ func (c *cellsPerRowLimitFilter) reset() { c.rowCount = 0 }
 
 type cellsPerColumnLimitFilter struct {
 	limit     int
-	colCounts map[string]int
+	colCounts map[string]map[string]int
 }
 
 func (c *cellsPerColumnLimitFilter) evaluate(cell cellInfo) bool {
 	if c.colCounts == nil {
-		c.colCounts = make(map[string]int)
+		c.colCounts = make(map[string]map[string]int)
 	}
-	col := cell.family + "\x00" + string(cell.qualifier)
-	n := c.colCounts[col]
+	quals := c.colCounts[cell.family]
+	if quals == nil {
+		quals = make(map[string]int)
+		c.colCounts[cell.family] = quals
+	}
+	col := string(cell.qualifier)
+	n := quals[col]
 	if n >= c.limit {
 		return false
 	}
-	c.colCounts[col] = n + 1
+	quals[col] = n + 1
 	return true
 }
 
@@ -515,7 +519,7 @@ func buildValueRangeFilter(vr *bigtablepb.ValueRange) *valueRangeFilter {
 
 func (v *valueRangeFilter) evaluate(cell cellInfo) bool {
 	if len(v.startValue) > 0 {
-		cmp := strings.Compare(string(cell.value), string(v.startValue))
+		cmp := bytes.Compare(cell.value, v.startValue)
 		if v.startInclusive {
 			if cmp < 0 {
 				return false
@@ -527,7 +531,7 @@ func (v *valueRangeFilter) evaluate(cell cellInfo) bool {
 		}
 	}
 	if len(v.endValue) > 0 {
-		cmp := strings.Compare(string(cell.value), string(v.endValue))
+		cmp := bytes.Compare(cell.value, v.endValue)
 		if v.endInclusive {
 			if cmp > 0 {
 				return false
