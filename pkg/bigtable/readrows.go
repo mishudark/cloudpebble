@@ -3,12 +3,14 @@ package bigtable
 import (
 	"bytes"
 	"math"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -43,6 +45,9 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 	}
 
 	db := eng.DB()
+	startTime := time.Now()
+	statsView := req.GetRequestStatsView()
+	var rowsSeen, rowsReturned, cellsSeen, cellsReturned int64
 	rowsLimit := req.GetRowsLimit()
 	if rowsLimit == 0 {
 		rowsLimit = 0 // unlimited
@@ -81,7 +86,7 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 	}
 
 	// Emit CellChunks for each scan range.
-	var chunkBuf []*bigtablepb.ReadRowsResponse_CellChunk
+	chunkBuf := make([]*bigtablepb.ReadRowsResponse_CellChunk, 0, cellChunkBufferSize)
 	var lastScannedRowKey []byte
 	rowCount := int64(0)
 
@@ -95,18 +100,20 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 		}
 	}
 
-	// Flush sends buffered chunks to the stream.
+	// Flush sends buffered chunks to the stream. Ownership of chunkBuf
+	// transfers to the response; a fresh buffer is allocated for the next
+	// batch to avoid mutating a message already handed to the stream.
 	flush := func() error {
 		if len(chunkBuf) == 0 {
 			return nil
 		}
 		resp := &bigtablepb.ReadRowsResponse{
-			Chunks: append([]*bigtablepb.ReadRowsResponse_CellChunk(nil), chunkBuf...),
+			Chunks: chunkBuf,
 		}
 		if len(lastScannedRowKey) > 0 {
 			resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
 		}
-		chunkBuf = chunkBuf[:0]
+		chunkBuf = make([]*bigtablepb.ReadRowsResponse_CellChunk, 0, cellChunkBufferSize)
 		return stream.Send(resp)
 	}
 
@@ -125,17 +132,30 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 		var lastRowKey []byte
 		var rowStarted bool
 
+		// Column coordinates of the last chunk sent on the stream. Per the
+		// ReadRows protocol, row_key/family_name/qualifier are only sent when
+		// they change; omitted fields continue the previous chunk's values.
+		// This matches real Bigtable behavior and avoids allocating wrapper
+		// messages and key copies for every cell.
+		var sentFamily string
+		var sentQualifier []byte
+		// rowCoordsPending marks that the next emitted cell starts a new row
+		// and must carry full coordinates. Tracked separately from the scan
+		// position because filters may skip a row's leading cells.
+		rowCoordsPending := false
+
 		for ; iter.Valid(); cfg.next(iter) {
 			rk, family, qualifier, ts, ok := dec.Decode(iter.Key())
 			if !ok {
 				continue
 			}
+			cellsSeen++
 
 			// Check row boundary.
 			if !bytes.Equal(rk, lastRowKey) {
 				if rowStarted {
 					commitLastChunk()
-					lastScannedRowKey = append([]byte(nil), lastRowKey...)
+					lastScannedRowKey = append(lastScannedRowKey[:0], lastRowKey...)
 				}
 				rowCount++
 				if rowsLimit > 0 && rowCount > rowsLimit {
@@ -146,6 +166,8 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 				}
 				lastRowKey = append(lastRowKey[:0], rk...)
 				rowStarted = true
+				rowCoordsPending = true
+				rowsSeen++
 			}
 
 			val := iter.Value()
@@ -158,7 +180,31 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 				val = nil
 			}
 
-			chunkBuf = appendCellChunks(chunkBuf, rk, family, qualifier, ts, val)
+			// Send cell coordinates only when they change. The first emitted
+			// cell of a row always carries the full coordinates so clients
+			// never associate it with a column from the previous row.
+			var chunkRowKey []byte
+			chunkFamily := ""
+			var chunkQualifier []byte
+			if rowCoordsPending {
+				chunkRowKey = rk
+				chunkFamily = family
+				chunkQualifier = qualifier
+				rowCoordsPending = false
+				rowsReturned++
+			} else {
+				if family != sentFamily {
+					chunkFamily = family
+				}
+				if !bytes.Equal(qualifier, sentQualifier) {
+					chunkQualifier = qualifier
+				}
+			}
+
+			chunkBuf = appendCellChunks(chunkBuf, chunkRowKey, chunkFamily, chunkQualifier, ts, val)
+			cellsReturned++
+			sentFamily = family
+			sentQualifier = append(sentQualifier[:0], qualifier...)
 
 			if len(chunkBuf) >= cellChunkBufferSize {
 				if err := flush(); err != nil {
@@ -170,13 +216,42 @@ func (s *Server) ReadRows(req *bigtablepb.ReadRowsRequest, stream grpc.ServerStr
 
 		if rowStarted {
 			commitLastChunk()
-			lastScannedRowKey = append([]byte(nil), lastRowKey...)
+			lastScannedRowKey = append(lastScannedRowKey[:0], lastRowKey...)
 		}
 		_ = iter.Close()
 
 		if rowsLimit > 0 && rowCount >= rowsLimit {
 			break
 		}
+	}
+
+	if statsView == bigtablepb.ReadRowsRequest_REQUEST_STATS_FULL {
+		// RequestStats is attached to the last message of the stream. gRPC
+		// marshals synchronously at Send time, so it must be set before the
+		// final flush rather than retrofitted onto an earlier response.
+		resp := &bigtablepb.ReadRowsResponse{
+			Chunks: chunkBuf,
+			RequestStats: &bigtablepb.RequestStats{
+				StatsView: &bigtablepb.RequestStats_FullReadStatsView{
+					FullReadStatsView: &bigtablepb.FullReadStatsView{
+						ReadIterationStats: &bigtablepb.ReadIterationStats{
+							RowsSeenCount:      rowsSeen,
+							RowsReturnedCount:   rowsReturned,
+							CellsSeenCount:      cellsSeen,
+							CellsReturnedCount:   cellsReturned,
+						},
+						RequestLatencyStats: &bigtablepb.RequestLatencyStats{
+							FrontendServerLatency: durationpb.New(time.Since(startTime)),
+						},
+					},
+				},
+			},
+		}
+		if len(lastScannedRowKey) > 0 {
+			resp.LastScannedRowKey = append([]byte(nil), lastScannedRowKey...)
+		}
+		// Send even when no chunks remain so the stats are delivered.
+		return stream.Send(resp)
 	}
 
 	return flush()
@@ -245,26 +320,33 @@ func appendCellChunks(buf []*bigtablepb.ReadRowsResponse_CellChunk, rowKey []byt
 
 // cellChunk creates a CellChunk for a single cell with full metadata.
 // rowKey is only set for the first cell of each row (caller should track this).
+// All byte-slice fields are copied out of iterator-owned memory in a single
+// shared allocation to minimize per-cell allocation count.
 func cellChunk(rowKey []byte, family string, qualifier []byte, timestampMicros int64, value []byte, labels []string) *bigtablepb.ReadRowsResponse_CellChunk {
 	chunk := &bigtablepb.ReadRowsResponse_CellChunk{
 		TimestampMicros: timestampMicros,
 		Labels:          labels,
 	}
-	if len(value) > 0 {
-		chunk.Value = make([]byte, len(value))
-		copy(chunk.Value, value)
-	}
-	if len(rowKey) > 0 {
-		chunk.RowKey = make([]byte, len(rowKey))
-		copy(chunk.RowKey, rowKey)
+	if n := len(rowKey) + len(qualifier) + len(value); n > 0 {
+		buf := make([]byte, n)
+		pos := 0
+		if len(rowKey) > 0 {
+			chunk.RowKey = buf[:len(rowKey)]
+			copy(chunk.RowKey, rowKey)
+			pos += len(rowKey)
+		}
+		if len(qualifier) > 0 {
+			chunk.Qualifier = wrapperspb.Bytes(buf[pos : pos+len(qualifier)])
+			copy(buf[pos:], qualifier)
+			pos += len(qualifier)
+		}
+		if len(value) > 0 {
+			chunk.Value = buf[pos:]
+			copy(chunk.Value, value)
+		}
 	}
 	if family != "" {
 		chunk.FamilyName = wrapperspb.String(family)
-	}
-	if len(qualifier) > 0 {
-		q := make([]byte, len(qualifier))
-		copy(q, qualifier)
-		chunk.Qualifier = wrapperspb.Bytes(q)
 	}
 	return chunk
 }

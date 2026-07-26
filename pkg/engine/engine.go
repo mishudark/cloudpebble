@@ -4,6 +4,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -161,6 +162,7 @@ type Engine struct {
 	coldMissCount  atomic.Int64
 	recovering     atomic.Bool
 	coldMissThresh int64
+	mergerFallback atomic.Bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -196,6 +198,10 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	}
 	if opts.PebbleOptions == nil {
 		opts.PebbleOptions = &pebble.Options{}
+	}
+	applyDefaultTableFilterPolicy(opts.PebbleOptions)
+	if opts.PebbleOptions.Merger == nil {
+		opts.PebbleOptions.Merger = int64SumMerger
 	}
 	opts.PebbleOptions.EnsureDefaults()
 	opts.PebbleOptions.DisableWAL = true
@@ -253,6 +259,23 @@ func Open(ctx context.Context, opts Options) (*Engine, error) {
 	e.ready.Store(true)
 
 	return e, nil
+}
+
+// applyDefaultTableFilterPolicy enables a uniform 10-bit Bloom filter policy
+// on all LSM levels, unless the caller configured any filter policy of their
+// own (including explicitly disabling filters with NoFilterPolicy). Filters
+// let point lookups (Engine.Get) and cold-miss probes skip SSTables that
+// cannot contain the key, avoiding block reads on negative lookups.
+// Must be called before opts.EnsureDefaults().
+func applyDefaultTableFilterPolicy(opts *pebble.Options) {
+	for i := range opts.Levels {
+		if opts.Levels[i].TableFilterPolicy != nil {
+			return
+		}
+	}
+	opts.ApplyTableFilterPolicy(func() pebble.DBTableFilterPolicy {
+		return pebble.DBTableFilterPolicyUniform
+	})
 }
 
 // recover downloads checkpoint data from object storage (if any) and
@@ -313,6 +336,16 @@ func (e *Engine) recover(ctx context.Context) error {
 	}
 
 	db, err := pebble.Open(e.localDir, e.pebbleOpts)
+	if err != nil && isMergerMismatch(err) && e.pebbleOpts.Merger == int64SumMerger {
+		// The local store was created by an older release whose default merger
+		// was pebble's concatenative one. Reopen with the recorded merger and
+		// disable aggregate mutations for this engine rather than failing.
+		e.logger.Warn("local store uses legacy merger; aggregate mutations disabled",
+			"dir", e.localDir)
+		e.pebbleOpts.Merger = pebble.DefaultMerger
+		e.mergerFallback.Store(true)
+		db, err = pebble.Open(e.localDir, e.pebbleOpts)
+	}
 	if err != nil {
 		return fmt.Errorf("opening pebble: %w", err)
 	}
@@ -942,7 +975,10 @@ func (e *Engine) checkEviction() {
 		return
 	}
 
-	_ = db.Compact(e.ctx, nil, nil, true)
+	// Compact the full keyspace to reclaim space. Pebble requires start < end,
+	// so a nil/nil range (which previously errored out silently) cannot be
+	// used. The 32-byte 0xFF end bound covers any realistic key.
+	_ = db.Compact(e.ctx, []byte{0x00}, bytes.Repeat([]byte{0xFF}, 32), true)
 	_ = e.Sync(e.ctx)
 }
 
