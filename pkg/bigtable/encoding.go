@@ -121,25 +121,148 @@ func encodeColumnPrefix(familyPrefix []byte, qualifier []byte) []byte {
 	return buf
 }
 
-// EncodeCellKey encodes a full Pebble key for a Bigtable cell.
+// EncodeCellKey encodes a full Pebble key for a Bigtable cell in a single
+// allocation. The key format is:
+//
+//	[escaped_row_key][0x00][0x00][family_len:1][family][0x00][qual_len:2][qualifier][0x00][inverted_ts:8]
 func EncodeCellKey(rowKey []byte, family string, qualifier []byte, timestampMicros int64) []byte {
-	rp := encodeRowPrefix(rowKey)
-	fp := encodeFamilyPrefix(rp, family)
-	cp := encodeColumnPrefix(fp, qualifier)
+	// Compute escaped row key length.
+	nullCount := 0
+	for _, c := range rowKey {
+		if c == 0x00 {
+			nullCount++
+		}
+	}
+	escapedRowLen := len(rowKey) + nullCount
 
-	buf := make([]byte, len(cp)+8)
-	copy(buf, cp)
-	binary.BigEndian.PutUint64(buf[len(cp):], invertedTimestamp(timestampMicros))
+	// Total key size:
+	//   escapedRowLen + 2 (row terminator)
+	// + 1 (family len) + len(family) + 1 (family terminator)
+	// + 2 (qual len) + len(qualifier) + 1 (qualifier terminator)
+	// + 8 (inverted timestamp)
+	totalLen := escapedRowLen + 2 + 1 + len(family) + 1 + 2 + len(qualifier) + 1 + 8
+
+	buf := make([]byte, totalLen)
+	pos := 0
+
+	// Write escaped row key.
+	if nullCount == 0 {
+		copy(buf[pos:], rowKey)
+		pos += len(rowKey)
+	} else {
+		for _, c := range rowKey {
+			if c == 0x00 {
+				buf[pos] = 0x00
+				buf[pos+1] = 0xFF
+				pos += 2
+			} else {
+				buf[pos] = c
+				pos++
+			}
+		}
+	}
+
+	// Row terminator.
+	buf[pos] = 0x00
+	buf[pos+1] = 0x00
+	pos += 2
+
+	// Family length + family + terminator.
+	buf[pos] = byte(len(family)) //nolint:gosec // bounds-checked: EncodeCellKey callers validate via applySetCell
+	pos++
+	copy(buf[pos:], family)
+	pos += len(family)
+	buf[pos] = 0x00
+	pos++
+
+	// Qualifier length + qualifier + terminator.
+	binary.BigEndian.PutUint16(buf[pos:], uint16(len(qualifier))) //nolint:gosec
+	pos += 2
+	copy(buf[pos:], qualifier)
+	pos += len(qualifier)
+	buf[pos] = 0x00
+	pos++
+
+	// Inverted timestamp.
+	binary.BigEndian.PutUint64(buf[pos:], invertedTimestamp(timestampMicros))
+
 	return buf
+}
+
+// encodeColumnIterBounds returns the [start, end) Pebble key bounds covering
+// all timestamp versions of a single column, encoded in one allocation.
+// start is the column prefix and end is the same prefix followed by 0xFF.
+// Returns nil bounds if family or qualifier exceed their length limits.
+func encodeColumnIterBounds(rowKey []byte, family string, qualifier []byte) (start, end []byte) {
+	if len(family) > math.MaxUint8 || len(qualifier) > math.MaxUint16 {
+		return nil, nil
+	}
+
+	nullCount := 0
+	for _, c := range rowKey {
+		if c == 0x00 {
+			nullCount++
+		}
+	}
+	escapedRowLen := len(rowKey) + nullCount
+
+	// Column prefix length + one extra byte for the 0xFF end marker.
+	prefixLen := escapedRowLen + 2 + 1 + len(family) + 1 + 2 + len(qualifier) + 1
+	buf := make([]byte, prefixLen+1)
+	pos := 0
+
+	if nullCount == 0 {
+		copy(buf, rowKey)
+		pos = len(rowKey)
+	} else {
+		for _, c := range rowKey {
+			if c == 0x00 {
+				buf[pos] = 0x00
+				buf[pos+1] = 0xFF
+				pos += 2
+			} else {
+				buf[pos] = c
+				pos++
+			}
+		}
+	}
+	buf[pos] = 0x00
+	buf[pos+1] = 0x00
+	pos += 2
+
+	buf[pos] = byte(len(family)) //nolint:gosec // bounds-checked above
+	pos++
+	copy(buf[pos:], family)
+	pos += len(family)
+	buf[pos] = 0x00
+	pos++
+
+	binary.BigEndian.PutUint16(buf[pos:], uint16(len(qualifier))) //nolint:gosec // bounds-checked above
+	pos += 2
+	copy(buf[pos:], qualifier)
+	pos += len(qualifier)
+	buf[pos] = 0x00
+	pos++
+
+	buf[pos] = 0xFF
+	return buf[:prefixLen], buf
 }
 
 // CellDecoder is a reusable decoder that decodes Pebble cell keys
 // with minimal allocations. After warmup (one key per unique row-key
-// length), Decode incurs zero heap allocations per call.
+// length and one per unique column family), Decode incurs zero heap
+// allocations per call.
 type CellDecoder struct {
 	rowKeyBuf    []byte
 	qualifierBuf []byte
+	// families interns family-name strings so decoding a cell does not
+	// allocate a new string per key. Bounded to avoid unbounded growth
+	// on adversarial key spaces.
+	families map[string]string
 }
+
+// maxInternedFamilies bounds the CellDecoder family-name intern cache.
+const maxInternedFamilies = 256
 
 // Decode decodes a Pebble key into its Bigtable components. The returned
 // rowKey slice points into the original key and is only valid until the
@@ -200,7 +323,19 @@ func (d *CellDecoder) Decode(key []byte) (rowKey []byte, family string, qualifie
 	if pos+famLen >= len(key) || key[pos+famLen] != 0x00 {
 		return
 	}
-	family = string(key[pos : pos+famLen])
+	// Intern the family name: the map lookup itself is allocation-free, and
+	// hit rates approach 100% since tables have few distinct families.
+	if interned, hit := d.families[string(key[pos:pos+famLen])]; hit {
+		family = interned
+	} else {
+		family = string(key[pos : pos+famLen])
+		if d.families == nil {
+			d.families = make(map[string]string, 8)
+		}
+		if len(d.families) < maxInternedFamilies {
+			d.families[family] = family
+		}
+	}
 	pos += famLen + 1
 
 	// Parse qualifier (copied into reusable buffer).

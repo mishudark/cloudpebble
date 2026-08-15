@@ -94,6 +94,27 @@ func (s *Store) List(ctx context.Context, prefix string) ([]string, error) {
 		return nil, fmt.Errorf("local: stat %s: %w", searchDir, statErr)
 	}
 
+	// Fast path: if the prefix ends with '/', the search path is a flat
+	// directory (e.g. {ns}/wal/, {ns}/data/). Use os.ReadDir which is a
+	// single syscall instead of the full WalkDir tree traversal.
+	if strings.HasSuffix(prefix, "/") {
+		entries, rErr := os.ReadDir(searchDir)
+		if rErr != nil {
+			return nil, fmt.Errorf("local: listing prefix %s: %w", prefix, rErr)
+		}
+		var found []string
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			rel := filepath.ToSlash(filepath.Join(prefix, entry.Name()))
+			found = append(found, rel)
+		}
+		sort.Strings(found)
+		return found, nil
+	}
+
+	// Slow path: prefix doesn't end with '/', may need to walk subdirectories.
 	var found []string
 	walkErr := filepath.WalkDir(searchDir, func(walkPath string, d os.DirEntry, walkPathErr error) error {
 		if walkPathErr != nil {

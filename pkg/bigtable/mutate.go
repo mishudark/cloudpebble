@@ -3,11 +3,11 @@ package bigtable
 import (
 	"context"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
+	"github.com/mishudark/cloudpebble/pkg/engine"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -34,7 +34,7 @@ func (s *Server) MutateRow(ctx context.Context, req *bigtablepb.MutateRowRequest
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 
-	if err := applyMutationsToBatch(batch, rowKey, req.GetMutations()); err != nil {
+	if err := applyMutationsToBatch(eng, batch, rowKey, req.GetMutations()); err != nil {
 		return nil, err
 	}
 
@@ -67,7 +67,7 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 	}
 
 	for i, entry := range entries {
-		if err = applyMutationsToBatch(batch, entry.GetRowKey(), entry.GetMutations()); err != nil {
+		if err = applyMutationsToBatch(eng, batch, entry.GetRowKey(), entry.GetMutations()); err != nil {
 			entryErrors = append(entryErrors, struct {
 				index int64
 				err   error
@@ -81,8 +81,12 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 				Period: &durationpb.Duration{Seconds: 1},
 				Factor: 1.0,
 			},
+			Entries: make([]*bigtablepb.MutateRowsResponse_Entry, 0, len(entries)),
 		}
-		errSet := make(map[int64]bool)
+		// All successful entries share one OK status message; statuses are
+		// only read during marshaling, never mutated.
+		ok := okStatus()
+		errSet := make(map[int64]bool, len(entryErrors))
 		for _, e := range entryErrors {
 			errSet[e.index] = true
 			resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
@@ -94,7 +98,7 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 			if !errSet[int64(i)] {
 				resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
 					Index:  int64(i),
-					Status: okStatus(),
+					Status: ok,
 				})
 			}
 		}
@@ -108,12 +112,14 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 				Period: &durationpb.Duration{Seconds: 1},
 				Factor: 1.0,
 			},
+			Entries: make([]*bigtablepb.MutateRowsResponse_Entry, len(entries)),
 		}
+		failStatus := toBigtableStatus(err)
 		for i := range entries {
-			resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
+			resp.Entries[i] = &bigtablepb.MutateRowsResponse_Entry{
 				Index:  int64(i),
-				Status: toBigtableStatus(err),
-			})
+				Status: failStatus,
+			}
 		}
 		return stream.Send(resp)
 	}
@@ -123,12 +129,14 @@ func (s *Server) MutateRows(req *bigtablepb.MutateRowsRequest, stream grpc.Serve
 			Period: &durationpb.Duration{Seconds: 1},
 			Factor: 1.0,
 		},
+		Entries: make([]*bigtablepb.MutateRowsResponse_Entry, len(entries)),
 	}
+	ok := okStatus()
 	for i := range entries {
-		resp.Entries = append(resp.Entries, &bigtablepb.MutateRowsResponse_Entry{
+		resp.Entries[i] = &bigtablepb.MutateRowsResponse_Entry{
 			Index:  int64(i),
-			Status: okStatus(),
-		})
+			Status: ok,
+		}
 	}
 	return stream.Send(resp)
 }
@@ -156,12 +164,28 @@ func (s *Server) CheckAndMutateRow(ctx context.Context, req *bigtablepb.CheckAnd
 
 	// Acquire per-row lock to ensure atomicity of predicate evaluation and
 	// mutation apply. This prevents two concurrent CheckAndMutateRow calls
-	// on the same row from racing on the predicate check.
+	// on the same row from racing on the predicate check. The entry is
+	// cleaned up when the last waiter releases the lock.
 	rowKeyStr := string(rowKey)
-	rowLockI, _ := ts.rowLocks.LoadOrStore(rowKeyStr, &sync.Mutex{})
-	rowLock, _ := rowLockI.(*sync.Mutex)
-	rowLock.Lock()
-	defer rowLock.Unlock()
+	ts.rowMu.Lock()
+	entry, ok := ts.rowLocks[rowKeyStr]
+	if !ok {
+		entry = &rowLockEntry{}
+		ts.rowLocks[rowKeyStr] = entry
+	}
+	entry.waiters++
+	ts.rowMu.Unlock()
+
+	entry.mu.Lock()
+	defer func() {
+		entry.mu.Unlock()
+		ts.rowMu.Lock()
+		entry.waiters--
+		if entry.waiters == 0 {
+			delete(ts.rowLocks, rowKeyStr)
+		}
+		ts.rowMu.Unlock()
+	}()
 
 	db := eng.DB()
 	predicateFilter := req.GetPredicateFilter()
@@ -181,7 +205,7 @@ func (s *Server) CheckAndMutateRow(ctx context.Context, req *bigtablepb.CheckAnd
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 
-	if err := applyMutationsToBatch(batch, rowKey, mutations); err != nil {
+	if err := applyMutationsToBatch(eng, batch, rowKey, mutations); err != nil {
 		return nil, err
 	}
 
@@ -218,9 +242,10 @@ func rowHasCells(db *pebble.DB, rowKey []byte, filter *bigtablepb.RowFilter) boo
 }
 
 // applyMutationsToBatch applies a list of Bigtable mutations to a Pebble batch.
-func applyMutationsToBatch(batch *pebble.Batch, rowKey []byte, mutations []*bigtablepb.Mutation) error {
+func applyMutationsToBatch(eng *engine.Engine, batch *pebble.Batch, rowKey []byte, mutations []*bigtablepb.Mutation) error {
+	nowMicros := time.Now().UnixMicro()
 	for _, mut := range mutations {
-		if err := applyMutationToBatch(batch, rowKey, mut); err != nil {
+		if err := applyMutationToBatch(eng, batch, rowKey, mut, nowMicros); err != nil {
 			return err
 		}
 	}
@@ -228,13 +253,13 @@ func applyMutationsToBatch(batch *pebble.Batch, rowKey []byte, mutations []*bigt
 }
 
 // applyMutationToBatch applies a single Bigtable mutation to a Pebble batch.
-func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mutation) error {
+func applyMutationToBatch(eng *engine.Engine, batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mutation, nowMicros int64) error {
 	switch m := mut.Mutation.(type) {
 	case *bigtablepb.Mutation_SetCell_:
-		return applySetCell(batch, rowKey, m.SetCell)
+		return applySetCell(batch, rowKey, m.SetCell, nowMicros)
 
 	case *bigtablepb.Mutation_DeleteFromColumn_:
-		return applyDeleteFromColumn(batch, rowKey, m.DeleteFromColumn)
+		return applyDeleteFromColumn(batch, rowKey, m.DeleteFromColumn, nowMicros)
 
 	case *bigtablepb.Mutation_DeleteFromFamily_:
 		return applyDeleteFromFamily(batch, rowKey, m.DeleteFromFamily)
@@ -243,17 +268,23 @@ func applyMutationToBatch(batch *pebble.Batch, rowKey []byte, mut *bigtablepb.Mu
 		return applyDeleteFromRow(batch, rowKey)
 
 	case *bigtablepb.Mutation_AddToCell_:
-		return status.Error(codes.Unimplemented, "AddToCell not supported")
+		if !eng.AggregatesSupported() {
+			return status.Error(codes.FailedPrecondition, "aggregate mutations are not supported by this table's storage (legacy merger)")
+		}
+		return applyAddToCell(eng.DB(), batch, rowKey, m.AddToCell)
 
 	case *bigtablepb.Mutation_MergeToCell_:
-		return status.Error(codes.Unimplemented, "MergeToCell not supported")
+		if !eng.AggregatesSupported() {
+			return status.Error(codes.FailedPrecondition, "aggregate mutations are not supported by this table's storage (legacy merger)")
+		}
+		return applyMergeToCell(eng.DB(), batch, rowKey, m.MergeToCell)
 
 	default:
 		return status.Error(codes.InvalidArgument, "unknown mutation type")
 	}
 }
 
-func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_SetCell) error {
+func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_SetCell, nowMicros int64) error {
 	if len(sc.GetFamilyName()) > math.MaxUint8 {
 		return status.Error(codes.InvalidArgument, "family name too long (max 255 bytes)")
 	}
@@ -262,28 +293,29 @@ func applySetCell(batch *pebble.Batch, rowKey []byte, sc *bigtablepb.Mutation_Se
 	}
 	ts := sc.GetTimestampMicros()
 	if ts == -1 {
-		ts = time.Now().UnixMicro()
+		ts = nowMicros
 	}
 	key := EncodeCellKey(rowKey, sc.GetFamilyName(), sc.GetColumnQualifier(), ts)
 	return batch.Set(key, sc.GetValue(), nil)
 }
 
-func applyDeleteFromColumn(batch *pebble.Batch, rowKey []byte, dc *bigtablepb.Mutation_DeleteFromColumn) error {
-	rp := encodeRowPrefix(rowKey)
-	fp := encodeFamilyPrefix(rp, dc.GetFamilyName())
-	cp := encodeColumnPrefix(fp, dc.GetColumnQualifier())
+func applyDeleteFromColumn(batch *pebble.Batch, rowKey []byte, dc *bigtablepb.Mutation_DeleteFromColumn, nowMicros int64) error {
+	cp, colEnd := encodeColumnIterBounds(rowKey, dc.GetFamilyName(), dc.GetColumnQualifier())
+	if cp == nil {
+		return status.Error(codes.InvalidArgument, "family or column qualifier too long")
+	}
 
 	tr := dc.GetTimeRange()
 	if tr != nil {
 		startTS := tr.GetStartTimestampMicros()
 		endTS := tr.GetEndTimestampMicros()
 		if endTS == 0 {
-			endTS = time.Now().UnixMicro()
+			endTS = nowMicros
 		}
 		start, end := encodeTimestampRangeBounds(cp, startTS, endTS)
 		return batch.DeleteRange(start, end, nil)
 	}
-	return batch.DeleteRange(cp, columnEndKey(cp), nil)
+	return batch.DeleteRange(cp, colEnd, nil)
 }
 
 func applyDeleteFromFamily(batch *pebble.Batch, rowKey []byte, df *bigtablepb.Mutation_DeleteFromFamily) error {

@@ -111,16 +111,22 @@ func (s *Server) ReadModifyWriteRow(ctx context.Context, req *bigtablepb.ReadMod
 	return &bigtablepb.ReadModifyWriteRowResponse{Row: row}, nil
 }
 
+// iterSource is satisfied by both *pebble.DB and *pebble.Batch.
+type iterSource interface {
+	NewIter(*pebble.IterOptions) (*pebble.Iterator, error)
+}
+
 // readCellValue reads the latest value for a specific column from the batch.
 // Returns nil if the cell does not exist.
-func readCellValue(batch *pebble.Batch, rowKey []byte, family string, qualifier []byte) []byte {
-	rp := encodeRowPrefix(rowKey)
-	fp := encodeFamilyPrefix(rp, family)
-	cp := encodeColumnPrefix(fp, qualifier)
+func readCellValue(batch iterSource, rowKey []byte, family string, qualifier []byte) []byte {
+	cp, end := encodeColumnIterBounds(rowKey, family, qualifier)
+	if cp == nil {
+		return nil
+	}
 
 	iter, err := batch.NewIter(&pebble.IterOptions{
 		LowerBound: cp,
-		UpperBound: columnEndKey(cp),
+		UpperBound: end,
 	})
 	if err != nil {
 		return nil

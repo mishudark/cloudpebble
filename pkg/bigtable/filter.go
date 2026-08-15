@@ -5,7 +5,6 @@ import (
 	"math/rand/v2"
 	"regexp"
 	"slices"
-	"strings"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/mishudark/cloudpebble/pkg/bigtable/bigtablepb"
@@ -16,22 +15,27 @@ type rowFilterEngine struct {
 	eval       filterEvaluator
 	stripValue bool
 	labels     []string
+	// sunk is set by sinkFilter evaluators when a cell passes a sink. Such
+	// cells are emitted to the output even if the overall filter rejects
+	// them. Reset before each cell evaluation.
+	sunk bool
 }
 
 // newRowFilterEngine creates the evaluation tree for a RowFilter.
 func newRowFilterEngine(filter *bigtablepb.RowFilter) (*rowFilterEngine, error) {
+	fe := &rowFilterEngine{}
 	if filter == nil {
-		return &rowFilterEngine{eval: &passAllFilter{}}, nil
+		fe.eval = &passAllFilter{}
+		return fe, nil
 	}
-	eval, err := buildEvaluator(filter)
+	eval, err := buildEvaluatorWithSink(filter, &fe.sunk)
 	if err != nil {
 		return nil, err
 	}
-	return &rowFilterEngine{
-		eval:       eval,
-		stripValue: evaluatorHasStripValue(eval),
-		labels:     evaluatorCollectLabels(eval),
-	}, nil
+	fe.eval = eval
+	fe.stripValue = evaluatorHasStripValue(eval)
+	fe.labels = evaluatorCollectLabels(eval)
+	return fe, nil
 }
 
 // cellInfo holds the decoded cell data passed through filter stages.
@@ -51,19 +55,29 @@ type filterEvaluator interface {
 
 // buildEvaluator recursively constructs the filter evaluation tree.
 func buildEvaluator(filter *bigtablepb.RowFilter) (filterEvaluator, error) {
+	var sunk bool
+	return buildEvaluatorWithSink(filter, &sunk)
+}
+
+// buildEvaluatorWithSink recursively constructs the filter evaluation tree.
+// sunk is the shared flag sink filters set on every cell that passes them.
+func buildEvaluatorWithSink(filter *bigtablepb.RowFilter, sunk *bool) (filterEvaluator, error) {
 	if filter == nil {
 		return &passAllFilter{}, nil
 	}
 
 	switch f := filter.Filter.(type) {
 	case *bigtablepb.RowFilter_Chain_:
-		return buildChain(f.Chain)
+		return buildChain(f.Chain, sunk)
 
 	case *bigtablepb.RowFilter_Interleave_:
-		return buildInterleave(f.Interleave)
+		return buildInterleave(f.Interleave, sunk)
 
 	case *bigtablepb.RowFilter_Condition_:
-		return buildCondition(f.Condition)
+		return buildCondition(f.Condition, sunk)
+
+	case *bigtablepb.RowFilter_Sink:
+		return &sinkFilter{sunk: sunk}, nil
 
 	case *bigtablepb.RowFilter_PassAllFilter:
 		return &passAllFilter{}, nil
@@ -141,10 +155,10 @@ type chainFilter struct {
 	filters []filterEvaluator
 }
 
-func buildChain(chain *bigtablepb.RowFilter_Chain) (*chainFilter, error) {
+func buildChain(chain *bigtablepb.RowFilter_Chain, sunk *bool) (*chainFilter, error) {
 	filters := make([]filterEvaluator, 0, len(chain.GetFilters()))
 	for _, f := range chain.GetFilters() {
-		eval, err := buildEvaluator(f)
+		eval, err := buildEvaluatorWithSink(f, sunk)
 		if err != nil {
 			return nil, err
 		}
@@ -181,16 +195,16 @@ type cellIdentity struct {
 	ts        int64
 }
 
-func buildInterleave(il *bigtablepb.RowFilter_Interleave) (*interleaveFilter, error) {
+func buildInterleave(il *bigtablepb.RowFilter_Interleave, sunk *bool) (*interleaveFilter, error) {
 	filters := make([]filterEvaluator, 0, len(il.GetFilters()))
 	for _, f := range il.GetFilters() {
-		eval, err := buildEvaluator(f)
+		eval, err := buildEvaluatorWithSink(f, sunk)
 		if err != nil {
 			return nil, err
 		}
 		filters = append(filters, eval)
 	}
-	return &interleaveFilter{filters: filters}, nil
+	return &interleaveFilter{filters: filters, seen: make(map[cellIdentity]bool)}, nil
 }
 
 func (il *interleaveFilter) evaluate(cell cellInfo) bool {
@@ -211,7 +225,7 @@ func (il *interleaveFilter) evaluate(cell cellInfo) bool {
 }
 
 func (il *interleaveFilter) reset() {
-	il.seen = nil
+	il.seen = make(map[cellIdentity]bool)
 	for _, f := range il.filters {
 		f.reset()
 	}
@@ -227,21 +241,21 @@ type conditionFilter struct {
 	evaluated   bool
 }
 
-func buildCondition(cond *bigtablepb.RowFilter_Condition) (*conditionFilter, error) {
-	pred, err := buildEvaluator(cond.GetPredicateFilter())
+func buildCondition(cond *bigtablepb.RowFilter_Condition, sunk *bool) (*conditionFilter, error) {
+	pred, err := buildEvaluatorWithSink(cond.GetPredicateFilter(), sunk)
 	if err != nil {
 		return nil, err
 	}
 	cf := &conditionFilter{predicate: pred}
 	if cond.GetTrueFilter() != nil {
-		tf, err := buildEvaluator(cond.GetTrueFilter())
+		tf, err := buildEvaluatorWithSink(cond.GetTrueFilter(), sunk)
 		if err != nil {
 			return nil, err
 		}
 		cf.trueFilter = tf
 	}
 	if cond.GetFalseFilter() != nil {
-		ff, err := buildEvaluator(cond.GetFalseFilter())
+		ff, err := buildEvaluatorWithSink(cond.GetFalseFilter(), sunk)
 		if err != nil {
 			return nil, err
 		}
@@ -274,6 +288,22 @@ func (c *conditionFilter) reset() {
 		c.falseFilter.reset()
 	}
 }
+
+// --- Sink ---
+
+// sinkFilter emits every cell that reaches it to the output (by setting the
+// shared sunk flag) while always passing the cell through to the rest of
+// the chain. This lets clients tee off intermediate results of a filter
+// chain, e.g. chain{sink, blockAll} streams all scanned cells.
+type sinkFilter struct {
+	sunk *bool
+}
+
+func (s *sinkFilter) evaluate(cell cellInfo) bool {
+	*s.sunk = true
+	return true
+}
+func (s *sinkFilter) reset() {}
 
 // --- Pass / Block ---
 
@@ -352,7 +382,7 @@ func (c *columnRangeFilter) evaluate(cell cellInfo) bool {
 		return true
 	}
 	if len(c.startQualifier) > 0 {
-		cmp := strings.Compare(string(cell.qualifier), string(c.startQualifier))
+		cmp := bytes.Compare(cell.qualifier, c.startQualifier)
 		if c.startInclusive {
 			if cmp < 0 {
 				return false
@@ -364,7 +394,7 @@ func (c *columnRangeFilter) evaluate(cell cellInfo) bool {
 		}
 	}
 	if len(c.endQualifier) > 0 {
-		cmp := strings.Compare(string(cell.qualifier), string(c.endQualifier))
+		cmp := bytes.Compare(cell.qualifier, c.endQualifier)
 		if c.endInclusive {
 			if cmp > 0 {
 				return false
@@ -437,19 +467,24 @@ func (c *cellsPerRowLimitFilter) reset() { c.rowCount = 0 }
 
 type cellsPerColumnLimitFilter struct {
 	limit     int
-	colCounts map[string]int
+	colCounts map[string]map[string]int
 }
 
 func (c *cellsPerColumnLimitFilter) evaluate(cell cellInfo) bool {
 	if c.colCounts == nil {
-		c.colCounts = make(map[string]int)
+		c.colCounts = make(map[string]map[string]int)
 	}
-	col := cell.family + "\x00" + string(cell.qualifier)
-	n := c.colCounts[col]
+	quals := c.colCounts[cell.family]
+	if quals == nil {
+		quals = make(map[string]int)
+		c.colCounts[cell.family] = quals
+	}
+	col := string(cell.qualifier)
+	n := quals[col]
 	if n >= c.limit {
 		return false
 	}
-	c.colCounts[col] = n + 1
+	quals[col] = n + 1
 	return true
 }
 
@@ -515,7 +550,7 @@ func buildValueRangeFilter(vr *bigtablepb.ValueRange) *valueRangeFilter {
 
 func (v *valueRangeFilter) evaluate(cell cellInfo) bool {
 	if len(v.startValue) > 0 {
-		cmp := strings.Compare(string(cell.value), string(v.startValue))
+		cmp := bytes.Compare(cell.value, v.startValue)
 		if v.startInclusive {
 			if cmp < 0 {
 				return false
@@ -527,7 +562,7 @@ func (v *valueRangeFilter) evaluate(cell cellInfo) bool {
 		}
 	}
 	if len(v.endValue) > 0 {
-		cmp := strings.Compare(string(cell.value), string(v.endValue))
+		cmp := bytes.Compare(cell.value, v.endValue)
 		if v.endInclusive {
 			if cmp > 0 {
 				return false
@@ -592,6 +627,15 @@ func randFloat64() float64 {
 
 // --- Filter engine methods ---
 
+// evaluateCell evaluates the filter for a single cell, honoring sink
+// side effects: a cell that passed a sink counts as emitted even when the
+// filter's final verdict rejects it.
+func (e *rowFilterEngine) evaluateCell(cell cellInfo) bool {
+	e.sunk = false
+	matched := e.eval.evaluate(cell)
+	return matched || e.sunk
+}
+
 // hasMatch returns true if any cell in the iterator matches the filter.
 func (e *rowFilterEngine) hasMatch(iter *pebble.Iterator) bool {
 	e.eval.reset()
@@ -604,7 +648,7 @@ func (e *rowFilterEngine) hasMatch(iter *pebble.Iterator) bool {
 			continue
 		}
 		val := iter.Value()
-		if e.eval.evaluate(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
+		if e.evaluateCell(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
 			hasAny = true
 			break
 		}
@@ -614,7 +658,7 @@ func (e *rowFilterEngine) hasMatch(iter *pebble.Iterator) bool {
 
 // matchesCell evaluates the filter for a single cell.
 func (e *rowFilterEngine) matchesCell(rowKey []byte, family string, qualifier []byte, ts int64, value []byte) bool {
-	return e.eval.evaluate(cellInfo{
+	return e.evaluateCell(cellInfo{
 		rowKey:    rowKey,
 		family:    family,
 		qualifier: qualifier,
@@ -677,7 +721,7 @@ func (e *rowFilterEngine) process(iter *pebble.Iterator, rp *RowProcessor) {
 			val = cell.valueBuf
 		}
 
-		if !e.eval.evaluate(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
+		if !e.evaluateCell(cellInfo{rowKey: rowKey, family: family, qualifier: qualifier, ts: ts, value: val}) {
 			continue
 		}
 

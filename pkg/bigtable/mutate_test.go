@@ -381,7 +381,7 @@ func TestMutateRowMissingMutations(t *testing.T) {
 	}
 }
 
-func TestMutateRowUnimplementedAddToCell(t *testing.T) {
+func TestMutateRowAddToCellEmptyIsInvalid(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 
@@ -399,14 +399,14 @@ func TestMutateRowUnimplementedAddToCell(t *testing.T) {
 
 	_, err := s.MutateRow(ctx, req)
 	if err == nil {
-		t.Fatal("expected error for AddToCell")
+		t.Fatal("expected error for empty AddToCell")
 	}
-	if status.Code(err) != codes.Unimplemented {
-		t.Fatalf("expected Unimplemented, got %v", status.Code(err))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected InvalidArgument, got %v", status.Code(err))
 	}
 }
 
-func TestMutateRowUnimplementedMergeToCell(t *testing.T) {
+func TestMutateRowMergeToCellNullIsNoop(t *testing.T) {
 	s := newTestServer(t)
 	ctx := context.Background()
 
@@ -422,12 +422,9 @@ func TestMutateRowUnimplementedMergeToCell(t *testing.T) {
 		},
 	}
 
-	_, err := s.MutateRow(ctx, req)
-	if err == nil {
-		t.Fatal("expected error for MergeToCell")
-	}
-	if status.Code(err) != codes.Unimplemented {
-		t.Fatalf("expected Unimplemented, got %v", status.Code(err))
+	// Merging NULL is allowed and has no effect.
+	if _, err := s.MutateRow(ctx, req); err != nil {
+		t.Fatalf("expected NULL MergeToCell to succeed, got %v", err)
 	}
 }
 

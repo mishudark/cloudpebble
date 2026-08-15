@@ -33,7 +33,12 @@ import (
 	"time"
 
 	"github.com/mishudark/cloudpebble/pkg/objstore"
+	"golang.org/x/sync/errgroup"
 )
+
+var mergeBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 0, 4096); return &b },
+}
 
 const (
 	walDir      = "wal"
@@ -59,6 +64,16 @@ type Manager struct {
 	closed      atomic.Bool
 	wg          sync.WaitGroup // tracks in-flight batch flush goroutines
 	flushMu     sync.Mutex     // serializes Flush() with background flushes
+
+	// flushCh dispatches batch flush tasks to the dedicated flush goroutine,
+	// avoiding goroutine-per-flush allocation under high write throughput.
+	flushCh chan flushTask
+}
+
+type flushTask struct {
+	seq     uint64
+	data    []byte
+	waiters []chan error
 }
 
 // NewManager creates a new WAL manager for the given namespace.
@@ -73,6 +88,7 @@ func NewManager(store objstore.Store, namespace string, batchWindow time.Duratio
 		store:       store,
 		ns:          namespace,
 		batchWindow: batchWindow,
+		flushCh:     make(chan flushTask, 1),
 	}
 	entries, err := m.listWALs(context.Background())
 	if err != nil {
@@ -84,6 +100,7 @@ func NewManager(store objstore.Store, namespace string, batchWindow time.Duratio
 	} else {
 		atomic.StoreUint64(&m.nextSeq, 1)
 	}
+	go m.flushWorker()
 	return m, nil
 }
 
@@ -103,6 +120,7 @@ func (m *Manager) Close() {
 		m.commitTimer = nil
 	}
 	m.mu.Unlock()
+	close(m.flushCh)
 	m.wg.Wait()
 }
 
@@ -146,6 +164,21 @@ func (m *Manager) Flush(ctx context.Context) error {
 
 	m.wg.Wait()
 	return err
+}
+
+// flushWorker is a dedicated goroutine that processes flush tasks from flushCh,
+// avoiding goroutine-per-flush allocation under high write throughput.
+func (m *Manager) flushWorker() {
+	for task := range m.flushCh {
+		p := m.walPath(task.seq)
+		// Always use context.Background() for background flushes so that
+		// shutdown cancellation does not silently lose the batch data.
+		err := m.store.Put(context.Background(), p, task.data)
+		for _, ch := range task.waiters {
+			ch <- err
+		}
+		m.wg.Done()
+	}
 }
 
 // walPath returns the full object store path for a WAL with the given seq.
@@ -229,22 +262,9 @@ func (m *Manager) flushPending() {
 	}
 
 	data := mergeBatchSegments(segments)
-	p := m.walPath(seq)
 
-	go func() {
-		defer m.wg.Done()
-		// Always use context.Background() for background flushes so that
-		// shutdown cancellation does not silently lose the batch data.
-		if err := m.store.Put(context.Background(), p, data); err != nil {
-			for _, ch := range waiters {
-				ch <- fmt.Errorf("walcloud: writing seq %d: %w", seq, err)
-			}
-			return
-		}
-		for _, ch := range waiters {
-			ch <- nil
-		}
-	}()
+	// Dispatch to the dedicated flush worker instead of spawning a goroutine.
+	m.flushCh <- flushTask{seq: seq, data: data, waiters: waiters}
 }
 
 // batchHeaderLen is the Pebble batch repr header size (seqnum + count).
@@ -285,16 +305,27 @@ func mergeBatchSegments(segments [][]byte) []byte {
 			total += len(s) - batchHeaderLen
 		}
 	}
+
+	// Acquire a buffer from the pool, growing if needed.
+	bufp, _ := mergeBufPool.Get().(*[]byte)
+	if bufp == nil {
+		b := make([]byte, 0, total)
+		bufp = &b
+	}
+	result := (*bufp)[:0]
+	if cap(result) < total {
+		result = make([]byte, 0, total)
+	}
+
 	if !allValid {
 		// Fall back to raw concatenation for undersized segments.
-		result := make([]byte, 0, total)
 		for _, s := range segments {
 			result = append(result, s...)
 		}
 		return result
 	}
 
-	result := make([]byte, total)
+	result = result[:total]
 	pos := copy(result, segments[0])
 	totalCount := batchCount(segments[0])
 
@@ -339,6 +370,24 @@ func (m *Manager) listWALs(ctx context.Context) ([]WalEntry, error) {
 	return entries, nil
 }
 
+// listWALsUnsorted lists WAL entries without sorting. Used by GC which only
+// needs to filter by seq, not iterate in order.
+func (m *Manager) listWALsUnsorted(ctx context.Context) ([]WalEntry, error) {
+	paths, err := m.store.List(ctx, m.walPrefix())
+	if err != nil {
+		return nil, err
+	}
+	var entries []WalEntry
+	for _, p := range paths {
+		seq, err := parseWALSeq(p)
+		if err != nil {
+			continue
+		}
+		entries = append(entries, WalEntry{Seq: seq, Path: p})
+	}
+	return entries, nil
+}
+
 // List returns all WAL entries present in object storage, sorted by sequence
 // number ascending.
 func (m *Manager) List(ctx context.Context) ([]WalEntry, error) {
@@ -355,35 +404,55 @@ func (m *Manager) ReadRecord(ctx context.Context, seq uint64) ([]byte, error) {
 	return data, nil
 }
 
-// GC deletes WAL objects that are no longer needed.
+// GC deletes WAL objects that are no longer needed. Deletions of expired
+// WALs (seq <= maxSeq) are parallelized for throughput.
 func (m *Manager) GC(ctx context.Context, maxSeq uint64, orphanTTL time.Duration) (deleted int, err error) {
-	entries, err := m.listWALs(ctx)
+	entries, err := m.listWALsUnsorted(ctx)
 	if err != nil {
 		return 0, err
 	}
+
+	// Partition entries into expired (parallel delete) and orphan candidates.
+	var expired []WalEntry
 	for _, e := range entries {
 		if e.Seq <= maxSeq {
-			if err := m.store.Delete(ctx, e.Path); err != nil {
-				return deleted, fmt.Errorf("walcloud: gc deleting seq %d: %w", e.Seq, err)
-			}
-			deleted++
+			expired = append(expired, e)
 			continue
 		}
 		if orphanTTL <= 0 {
 			continue
 		}
-		info, err := m.store.Attrs(ctx, e.Path)
-		if err != nil {
+		info, aErr := m.store.Attrs(ctx, e.Path)
+		if aErr != nil {
 			continue
 		}
 		if time.Since(info.CreatedAt) > orphanTTL {
-			if err := m.store.Delete(ctx, e.Path); err != nil {
-				return deleted, fmt.Errorf("walcloud: gc deleting orphan seq %d: %w", e.Seq, err)
-			}
-			deleted++
+			expired = append(expired, e)
 		}
 	}
-	return deleted, nil
+
+	if len(expired) == 0 {
+		return 0, nil
+	}
+
+	// Parallel delete expired WALs.
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(8)
+	var delCount atomic.Int64
+	for _, e := range expired {
+		e := e
+		g.Go(func() error {
+			if gErr := m.store.Delete(gctx, e.Path); gErr != nil {
+				return fmt.Errorf("walcloud: gc deleting seq %d: %w", e.Seq, gErr)
+			}
+			delCount.Add(1)
+			return nil
+		})
+	}
+	if gErr := g.Wait(); gErr != nil {
+		return int(delCount.Load()), gErr
+	}
+	return int(delCount.Load()), nil
 }
 
 // NextSeq returns the next sequence number that will be assigned.

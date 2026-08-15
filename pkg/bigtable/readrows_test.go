@@ -298,8 +298,13 @@ func TestReadRowsWithFilter(t *testing.T) {
 		t.Fatalf("expected 2 chunks, got %d", len(allChunks))
 	}
 
+	// Decode chunks with client-style continuation semantics: family_name
+	// is only present when it changes.
+	fam := ""
 	for _, c := range allChunks {
-		fam := c.GetFamilyName().GetValue()
+		if c.FamilyName != nil {
+			fam = c.GetFamilyName().GetValue()
+		}
 		if fam != "cf1" {
 			t.Fatalf("expected family cf1, got %q", fam)
 		}
